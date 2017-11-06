@@ -43,7 +43,15 @@ subroutine dump_all
         call PXFMKDIR(TRIM(filedirini),LEN(TRIM(filedirini)),O'755',info)
         call PXFMKDIR(TRIM(filedir),LEN(TRIM(filedir)),O'755',info)
 #else
-        call system(filecmd)
+        call EXECUTE_COMMAND_LINE(filecmd,exitstat=ierr,wait=.true.)
+        if(ierr.ne.0 .and. ierr.ne.127)then
+           write(*,*) 'Error - Could not create ',trim(filedir),' error code=',ierr
+#ifndef WITHOUTMPI
+           call MPI_ABORT(MPI_COMM_WORLD,1,info)
+#else
+           stop
+#endif
+        endif
 #endif
      endif
      
@@ -74,7 +82,7 @@ subroutine dump_all
            filename=TRIM(filedir)//'hydro_file_descriptor.txt'
            call file_descriptor_hydro(filename)
         end if
-        if(cooling)then
+        if(cooling .and. .not. neq_chem)then
            filename=TRIM(filedir)//'cooling_'//TRIM(nchar)//'.out'
            call output_cool(filename)
         end if
@@ -189,6 +197,16 @@ subroutine dump_all
 #endif
         if(myid==1.and.print_when_io) write(*,*)'End backup gadget format'
      end if
+
+     if(myid==1.and.print_when_io) write(*,*)'Start timer'
+     ! Output timer: must be called by each process !
+     filename=TRIM(filedir)//'timer_'//TRIM(nchar)//'.txt'
+     call output_timer(.true., filename)
+#ifndef WITHOUTMPI
+     if(synchro_when_io) call MPI_BARRIER(MPI_COMM_WORLD,info)
+#endif     
+     if(myid==1.and.print_when_io) write(*,*)'End output timer'
+     
   end if
 
 end subroutine dump_all
@@ -270,7 +288,7 @@ subroutine backup_amr(filename)
   write(ilun)dtold(1:nlevelmax)
   write(ilun)dtnew(1:nlevelmax)
   write(ilun)nstep,nstep_coarse
-  write(ilun)const,mass_tot_0,rho_tot
+  write(ilun)einit,mass_tot_0,rho_tot
   write(ilun)omega_m,omega_l,omega_k,omega_b,h0,aexp_ini,boxlen_ini
   write(ilun)aexp,hexp,aexp_old,epot_tot_int,epot_tot_old
   write(ilun)mass_sph
@@ -402,9 +420,12 @@ subroutine output_info(filename)
   use hydro_commons
   use pm_commons
   implicit none
+#ifndef WITHOUTMPI
+  include 'mpif.h'
+#endif
   character(LEN=80)::filename
 
-  integer::nx_loc,ny_loc,nz_loc,ilun,icpu,idom
+  integer::nx_loc,ny_loc,nz_loc,ilun,icpu,idom,ierr
   real(dp)::scale
   real(dp)::scale_nH,scale_T2,scale_l,scale_d,scale_t,scale_v
   character(LEN=80)::fileloc
@@ -426,7 +447,15 @@ subroutine output_info(filename)
 
   ! Open file
   fileloc=TRIM(filename)
-  open(unit=ilun,file=fileloc,form='formatted')
+  open(unit=ilun,file=fileloc,form='formatted',iostat=ierr)
+  if(ierr .ne. 0)then
+     write(*,*) 'Error - Could not write ',fileloc
+#ifndef WITHOUTMPI
+     call MPI_ABORT(MPI_COMM_WORLD,1,ierr)
+#else
+     stop
+#endif
+  endif
   
   ! Write run parameters
   write(ilun,'("ncpu        =",I11)')ncpu
@@ -586,7 +615,7 @@ subroutine savegadget(filename)
 #ifndef LONGINT
   header%nparttotal(2) = npart_tot
 #else
-  header%nparttotal(2) = MOD(npart_tot,4294967296)
+  header%nparttotal(2) = MOD(npart_tot,4294967296_i8b)
 #endif
   header%flag_cooling = 0
   header%numfiles = ncpu
@@ -600,7 +629,7 @@ subroutine savegadget(filename)
 #ifndef LONGINT
   header%totalhighword(2) = 0
 #else
-  header%totalhighword(2) = npart_tot/4294967296
+  header%totalhighword(2) = npart_tot/4294967296_i8b
 #endif
   header%flag_entropy_instead_u = 0
   header%flag_doubleprecision = 0

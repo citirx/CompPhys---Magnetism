@@ -144,7 +144,7 @@ subroutine init_time
      !Set initial expansion factor (for internal units).
      !Set expansion factor to 1 for non-cosmological simulation
      ! Safety for GRACKLE initialisation
-     my_grackle_units%a_value = aexp_ini
+     my_grackle_units%a_value = MAX(aexp_ini,0.0625)
    
      if(cosmo) then
         my_grackle_units%comoving_coordinates = 1
@@ -419,6 +419,7 @@ subroutine init_cosmo
   use hydro_commons
   use pm_commons
   use gadgetreadfilemod
+  use dice_commons
 
   implicit none
 #ifndef WITHOUTMPI
@@ -561,6 +562,29 @@ subroutine init_cosmo
      omega_l = gadgetheader%omegalambda
      h0 = gadgetheader%hubbleparam * 100.d0
      boxlen_ini = gadgetheader%boxsize
+     aexp = gadgetheader%time
+     aexp_ini = aexp
+     ! Compute SPH equivalent mass (initial gas mass resolution)
+     mass_sph=omega_b/omega_m*0.5d0**(ndim*levelmin)
+     nlevelmax_part = levelmin
+     astart(levelmin) = aexp
+     xoff1(levelmin)=0
+     xoff2(levelmin)=0
+     xoff3(levelmin)=0
+     dxini(levelmin) = boxlen_ini/(nx*2**levelmin*(h0/100.0))
+
+  CASE ('dice')
+     if (verbose) write(*,*)'Reading in gadget format from'//TRIM(initfile(levelmin))//'/'//TRIM(ic_file)
+     call gadgetreadheader(TRIM(initfile(levelmin))//'/'//TRIM(ic_file), 0,gadgetheader, ok)
+     if(.not.ok) call clean_stop
+     omega_m = gadgetheader%omega0
+     omega_l = gadgetheader%omegalambda
+     h0 = gadgetheader%hubbleparam * 100.d0
+     if(gadgetheader%boxsize>0d0) then 
+        boxlen_ini = gadgetheader%boxsize/1e3
+     else
+        boxlen_ini = boxlen
+     endif
      aexp = gadgetheader%time
      aexp_ini = aexp
      ! Compute SPH equivalent mass (initial gas mass resolution)

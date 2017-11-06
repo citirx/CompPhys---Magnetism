@@ -27,7 +27,7 @@ subroutine init_part
   integer::i1,i2,i3,i1_min,i1_max,i2_min,i2_max,i3_min,i3_max
   integer::buf_count,indglob,npart_new
   real(dp)::dx,xx1,xx2,xx3,vv1,vv2,vv3,mm1,ll1,ll2,ll3
-  real(dp)::scale,dx_loc,rr,rmax,dx_min
+  real(dp)::scale,dx_loc,rr,rmax,dx_min,min_mdm_cpu,min_mdm_all
   integer::ncode,bit_length,temp
   real(kind=8)::bscale
   real(dp),dimension(1:twotondim,1:3)::xc
@@ -60,9 +60,11 @@ subroutine init_part
   character(LEN=80)::filename,filename_x
   character(LEN=80)::fileloc
   character(LEN=20)::filetype_loc
-  character(LEN=5)::nchar
+  character(LEN=5)::nchar,ncharcpu
+  integer,parameter::tagg=1109,tagg2=1110,tagg3=1111
+  integer::dummy_io,info2
 
-  ! DICE patch
+! DICE patch
   integer::j,type_index
   integer::dummy_int,blck_size,jump_blck,blck_cnt,stat,ifile
   integer::head_blck,pos_blck,vel_blck,id_blck,mass_blck,u_blck,metal_blck,age_blck
@@ -74,10 +76,10 @@ subroutine init_part
   real,dimension(1:nvector,1:3)::xx_sp,vv_sp
   real,dimension(1:nvector)::mm_sp,tt_sp,zz_sp,uu_sp
   real(dp)::mgas_tot
-  real::dummy_real
+  real::dummy_real,ipbar
   character(LEN=12)::ifile_str
   character(LEN=4)::blck_name
-  logical::eob,file_exists
+  logical::eob,file_exists,skip
   TYPE(gadgetheadertype)::header
   ! DICE patch
 
@@ -99,8 +101,13 @@ subroutine init_part
 #ifdef OUTPUT_PARTICLE_POTENTIAL
   allocate(ptcl_phi(npartmax))
 #endif
-  allocate(up    (npartmax))
-  xp=0.0; vp=0.0; mp=0.0; levelp=0; idp=0; up=0.
+  ! patch DICE
+  allocate(up(npartmax))
+  if(ic_mask_ptype.gt.-1)then
+     allocate(maskp(npartmax))
+  endif
+  ! patch DICE
+  xp=0.0; vp=0.0; mp=0.0; levelp=0; idp=0
   if(star.or.sink)then
      allocate(tp(npartmax))
      tp=0.0
@@ -118,9 +125,26 @@ subroutine init_part
 
      ilun=2*ncpu+myid+10
      call title(nrestart,nchar)
-     fileloc='output_'//TRIM(nchar)//'/part_'//TRIM(nchar)//'.out'
+
+     if(IOGROUPSIZEREP>0)then
+        call title(((myid-1)/IOGROUPSIZEREP)+1,ncharcpu)
+        fileloc='output_'//TRIM(nchar)//'/group_'//TRIM(ncharcpu)//'/part_'//TRIM(nchar)//'.out'
+     else
+        fileloc='output_'//TRIM(nchar)//'/part_'//TRIM(nchar)//'.out'
+     endif
+
      call title(myid,nchar)
      fileloc=TRIM(fileloc)//TRIM(nchar)
+     ! Wait for the token                                                                                                                                                                    
+#ifndef WITHOUTMPI
+     if(IOGROUPSIZE>0) then
+        if (mod(myid-1,IOGROUPSIZE)/=0) then
+           call MPI_RECV(dummy_io,1,MPI_INTEGER,myid-1-1,tagg,&
+                & MPI_COMM_WORLD,MPI_STATUS_IGNORE,info2)
+        end if
+     endif
+#endif
+
 
      open(unit=ilun,file=fileloc,form='unformatted')
      rewind(ilun)
@@ -168,13 +192,11 @@ subroutine init_part
         allocate(xdp(1:npart2))
         read(ilun)xdp
         tp(1:npart2)=xdp
-#ifdef RT
         if(convert_birth_times) then
            do i = 1, npart2 ! Convert birth time to proper for RT postpr.
               call getProperTime(tp(i),tp(i))
            enddo
         endif
-#endif
         if(metal)then
            ! Read metallicity
            read(ilun)xdp
@@ -183,6 +205,32 @@ subroutine init_part
         deallocate(xdp)
      end if
      close(ilun)
+
+     ! Send the token      
+#ifndef WITHOUTMPI
+     if(IOGROUPSIZE>0) then
+        if(mod(myid,IOGROUPSIZE)/=0 .and.(myid.lt.ncpu))then
+           dummy_io=1
+           call MPI_SEND(dummy_io,1,MPI_INTEGER,myid-1+1,tagg, &
+                & MPI_COMM_WORLD,info2)
+        end if
+     endif
+#endif
+     ! Get nlevelmax_part from cosmological inital conditions
+     if(cosmo)then
+        min_mdm_cpu = 1.0
+        do ipart=1,npart2
+           if(star)then
+              if(tp(ipart).eq.0d0)then
+                 if(mp(ipart).lt.min_mdm_cpu) min_mdm_cpu = mp(ipart)
+              endif
+           else
+              if(mp(ipart).lt.min_mdm_cpu) min_mdm_cpu = mp(ipart)
+           endif
+        enddo
+        if(myid==1) write(*,*) 'nlevelmax_part=',nlevelmax_part
+     endif
+
      if(debug)write(*,*)'part.tmp read for processor ',myid
      npart=npart2     
 
@@ -336,6 +384,15 @@ subroutine init_part
                                
               if(multiple)then
                  ilun=myid+10
+                 ! Wait for the token                                                                                                                                                        
+#ifndef WITHOUTMPI
+                 if(IOGROUPSIZE>0) then
+                    if (mod(myid-1,IOGROUPSIZE)/=0) then
+                       call MPI_RECV(dummy_io,1,MPI_INTEGER,myid-1-1,tagg2,&
+                            & MPI_COMM_WORLD,MPI_STATUS_IGNORE,info2)
+                    end if
+                 endif
+#endif
                  open(ilun,file=filename,form='unformatted')
                  rewind ilun
                  read(ilun) ! skip first line
@@ -349,6 +406,17 @@ subroutine init_part
                     endif
                  end do
                  close(ilun)
+                 ! Send the token                                                                                                                                                            
+#ifndef WITHOUTMPI
+                 if(IOGROUPSIZE>0) then
+                    if(mod(myid,IOGROUPSIZE)/=0 .and.(myid.lt.ncpu))then
+                       dummy_io=1
+                       call MPI_SEND(dummy_io,1,MPI_INTEGER,myid-1+1,tagg2, &
+                            & MPI_COMM_WORLD,info2)
+                    end if
+                 endif
+#endif
+
               else
                  if(myid==1)then
                     open(10,file=filename,form='unformatted')
@@ -767,10 +835,11 @@ subroutine init_part
         ! Conversion factor from user units to cgs units
         call units(scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2)
         scale_m = scale_d*scale_l**3
-        ! Reading header of the Gadget1 file
+        ! Reading header of the Gadget file
         error=.false.
+        ipart    = 0
         do ifile=1,ic_nfile
-            write(ifile_str,*) ifile-1
+            write(ifile_str,*) ifile
             if(ic_nfile.eq.1) then
                filename=TRIM(initfile(levelmin))//'/'//TRIM(ic_file)
             else
@@ -778,13 +847,13 @@ subroutine init_part
             endif
             INQUIRE(FILE=filename,EXIST=file_exists) 
             if(.not.file_exists) then 
-               write(*,*) TRIM(filename)," not found"
+               if(myid==1) write(*,*) TRIM(filename)," not found"
                call clean_stop
             endif
             if(myid==1)then
               write(*,'(A12,A)') " Opening -> ",filename
               if((ic_format.ne.'Gadget1').and.(ic_format.ne.'Gadget2')) then
-                write(*,*) 'Specify a valid IC file format [ic_format=Gadget1/Gadget2]'
+                  if(myid==1) write(*,*) 'Specify a valid IC file format [ic_format=Gadget1/Gadget2]'
                 error=.true.
               endif
               OPEN(unit=1,file=filename,status='old',action='read',form='unformatted',access="stream")
@@ -924,16 +993,42 @@ subroutine init_part
               npart     = sum(header%npart)
               ngas      = header%npart(1)
               nhalo     = header%npart(2)
+              if(cosmo) T2_start = 1.356d-2/aexp**2
 
               write(*,'(A50)')"__________________________________________________"
               write(*,*)"Found ",npart," particles"
-              write(*,*)"----> ",header%npart(1)," gas particles"
-              write(*,*)"----> ",header%npart(2)," halo particles"
-              write(*,*)"----> ",header%npart(3)," disk particles"
-              write(*,*)"----> ",header%npart(4)," bulge particles"
-              write(*,*)"----> ",header%npart(5)," stars particles"
-              write(*,'(A50)')"__________________________________________________"
-              if((pos_size.ne.npart).or.(vel_size.ne.npart)) then
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.0) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(1)," type 0 particles"
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.1) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(2)," type 1 particles"
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.2) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(3)," type 2 particles"
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.3) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(4)," type 3 particles"
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.4) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(5)," type 4 particles"
+              skip=.false.
+              do j=1,6
+                 if(ic_skip_type(j).eq.5) skip=.true.
+              enddo
+              if(.not.skip) write(*,*)"----> ",header%npart(6)," type 5 particles"
+              write(*,'(A50)')"_____________________progress_____________________"
+              if((pos_size.ne.npart).or.(vel_size.ne.npart).or.((metal_size.ne.npart).and.(metal_size.ne.ngas+nstar_tot))) then
                 write(*,*) 'POS =',pos_size
                 write(*,*) 'Z   =',metal_size
                 write(*,*) 'VEL =',vel_size
@@ -947,17 +1042,17 @@ subroutine init_part
               call MPI_BCAST(nstar_tot,1,MPI_INTEGER,0,MPI_COMM_WORLD,info)
 #endif
             eob      = .false.
-            ipart    = 0
             kpart    = 0
             lpart    = 0
             mpart    = 0
             gpart    = 0
             opart    = 0
             mgas_tot = 0.
+            ipbar    = 0.
             do while(.not.eob)
               xx=0.
               vv=0.
-              ii=0.
+              ii=0
               mm=0.
               tt=0.
               zz=0.
@@ -988,7 +1083,7 @@ subroutine init_part
                   if(id_blck.ne.-1) then
                     read(1,POS=id_blck+sizeof(dummy_int)*(kpart-1)) ii(i)
                   else
-                    ii(i) = (kpart-1)
+                    ii(i) = kpart
                   endif
                   if(kpart.le.header%npart(1)) then
                     if((u_blck.ne.-1).and.(u_size.eq.header%npart(1))) then
@@ -1011,9 +1106,23 @@ subroutine init_part
                     endif
                   endif
                   ! Scaling to ramses code units
-                  xx(i,:)   = xx_sp(i,:)*gadget_scale_l/scale_l*ic_scale_pos
-                  vv(i,:)   = vv_sp(i,:)*gadget_scale_v/scale_v*ic_scale_vel
-                  mm(i)     = mm_sp(i)*gadget_scale_m/scale_m*ic_scale_mass
+                  if(cosmo) then
+                    gadget_scale_l = scale_l/header%boxsize
+                    gadget_scale_v = 1e3*SQRT(aexp)/header%boxsize*aexp/100.
+                  endif
+                  xx(i,:)   = xx_sp(i,:)*(gadget_scale_l/scale_l)*ic_scale_pos
+                  vv(i,:)   = vv_sp(i,:)*(gadget_scale_v/scale_v)*ic_scale_vel
+                  mm(i)     = mm_sp(i)*(gadget_scale_m/scale_m)*ic_scale_mass
+                  if(cosmo) then
+                    if(type_index .eq. 1) mass_sph = mm(i)
+                    if(xx(i,1)<  0.0d0  )xx(i,1)=xx(i,1)+dble(nx)
+                    if(xx(i,1)>=dble(nx))xx(i,1)=xx(i,1)-dble(nx)
+                    if(xx(i,2)<  0.0d0  )xx(i,2)=xx(i,2)+dble(ny)
+                    if(xx(i,2)>=dble(ny))xx(i,2)=xx(i,2)-dble(ny)
+                    if(xx(i,3)<  0.0d0  )xx(i,3)=xx(i,3)+dble(nz)
+                    if(xx(i,3)>=dble(nz))xx(i,3)=xx(i,3)-dble(nz)
+                  endif
+
                   if(metal) then
                     if(metal_blck.ne.-1) then
                       zz(i) = zz_sp(i)*ic_scale_metal
@@ -1021,15 +1130,30 @@ subroutine init_part
                   endif
                   if(kpart.gt.header%npart(1)+header%npart(2)) then
                     if(age_blck.ne.-1) then
-                      tt(i) = tt_sp(i)*gadget_scale_t/(scale_t/aexp**2)*ic_scale_age
+                      if(cosmo) then
+                        tt(i) = tt_sp(i)
+                      else
+                        tt(i) = tt_sp(i)*(gadget_scale_t/(scale_t/aexp**2))*ic_scale_age
+                      endif
                     endif
                   endif
                   if(kpart.le.header%npart(1)) then
-                    uu(i)   = uu_sp(i)*mu_mol*(gadget_scale_v/scale_v)**2*ic_scale_u
+                    if(cosmo) then
+                      uu(i) = T2_start/scale_T2
+                    else
+                      ! Temperature stored in units of K/mu
+                      uu(i) = uu_sp(i)*mu_mol*(gadget_scale_v/scale_v)**2*ic_scale_u
+                    endif
+
                   endif
                   if(kpart.le.header%npart(1)) mgas_tot = mgas_tot+mm(i)
                   ! Check the End Of Block
+                  if(kpart.ge.ipbar*(npart/49.0))then
+                     write(*,'(A1)',advance='no') "_"
+                     ipbar = ipbar+1.0
+                  endif
                   if(kpart.ge.npart) then
+                    write(*,'(A1)') " "
                     write(*,'(A,A7,A)') ' ',TRIM(ic_format),' file successfully loaded'
                     write(*,'(A50)')"__________________________________________________"
                     eob=.true.
@@ -1055,28 +1179,75 @@ subroutine init_part
                   ! Check the CPU map
                   if(cc(i)==myid)then
 #endif
-                    ipart          = ipart+1
-                    if(ipart.gt.npartmax) then
-                       write(*,*) "Increase npartmax"
-                       call clean_stop
+                    ! Determine current particle type
+                    if((lpart+i).le.header%npart(1)) type_index = 1
+                    do j=1,5
+                       if((lpart+i).gt.sum(header%npart(1:j)).and.(lpart+i).le.sum(header%npart(1:j+1))) type_index = j+1
+                    enddo
+                    skip           = .false.
+                    do j=1,6
+                       if(ic_skip_type(j).eq.type_index-1) skip=.true.
+                    enddo
+                    if(.not.skip) then 
+                       if(abs(xx(i,1)-ic_center(1)).ge.boxlen/2d0) cycle
+                       if(abs(xx(i,2)-ic_center(2)).ge.boxlen/2d0) cycle
+                       if(abs(xx(i,3)-ic_center(3)).ge.boxlen/2d0) cycle
+                       ipart          = ipart+1
+                       if(ipart.gt.npartmax) then
+                          write(*,*) "Increase npartmax"
+#ifndef WITHOUTMPI
+                          call MPI_ABORT(MPI_COMM_WORLD,1,info)
+#else
+                          stop
+#endif
+                       endif
+                       xp(ipart,1:3)  = xx(i,1:3)+boxlen/2.0D0-ic_center(1:3)
+                       vp(ipart,1:3)  = vv(i,1:3)
+                       ! Flag gas particles with idp=1
+                       if(type_index.gt.1)then
+                         idp(ipart)   = ii(i)+1
+                       else
+                         idp(ipart)   = 1
+                       endif
+                       mp(ipart)      = mm(i)
+                       levelp(ipart)  = levelmin
+                       if(star) then
+                         tp(ipart)    = tt(i)
+                         ! Particle metallicity
+                         if(metal) then
+                           zp(ipart)  = zz(i)
+                         endif
+                       endif
+                       up(ipart)      = uu(i)
+                       if(ic_mask_ptype.gt.-1)then
+                           if(ic_mask_ptype.eq.type_index-1)then
+                              maskp(ipart) = 1.0
+                           else
+                              maskp(ipart) = 0.0
+                           endif
+                       endif
+                       ! Add a gas particle outside the zoom region
+                       if(cosmo) then
+                         do j=1,6
+                            if(type_index.eq.cosmo_add_gas_index(j)) then
+                               ! Add a gas particle
+                               xp(ipart+1,1:3) = xp(ipart,1:3)
+                               vp(ipart+1,1:3) = vp(ipart,1:3)
+                               idp(ipart+1)    = -1
+                               mp(ipart+1)     = mp(ipart)*(omega_b/omega_m)
+                               levelp(ipart+1) = levelmin
+                               up(ipart+1)     = T2_start/scale_T2
+                               if(metal) then
+                                  zp(ipart+1)  = z_ave*0.02
+                               endif
+                               ! Remove mass from the DM particle
+                               mp(ipart) = mp(ipart)-mp(ipart+1)
+                               ! Update index
+                               ipart           = ipart+1
+                            endif
+                         end do
+                       endif
                     endif
-                    xp(ipart,1:3)  = xx(i,1:3)+boxlen/2.0D0-ic_center(1:3)
-                    vp(ipart,1:3)  = vv(i,1:3)
-                    ! Flag gas particles with idp=1
-                    if((lpart+i).gt.header%npart(1))then
-                      idp(ipart)   = ii(i)+1
-                    else
-                      idp(ipart)   = 1
-                    endif
-                    mp(ipart)      = mm(i)
-                    levelp(ipart)  = levelmin
-                    if(star) then
-                      tp(ipart)    = tt(i)
-                    endif
-                    if(metal) then
-                      zp(ipart)    = zz(i)
-                    endif
-                    up(ipart)      = uu(i)
 #ifndef WITHOUTMPI
                   endif
 #endif
@@ -1084,7 +1255,7 @@ subroutine init_part
               lpart = lpart+jpart
             enddo
             if(myid==1)then
-               write(*,'(A,F10.3,A)') ' Gas mass in AMR grid -> ',mgas_tot,'D9 Msol'
+               write(*,'(A,E10.3,A)') ' Gas mass in AMR grid -> ',mgas_tot,' unit_m'
                write(*,'(A50)')"__________________________________________________"
                close(1)
             endif
@@ -1097,11 +1268,20 @@ subroutine init_part
 #ifndef WITHOUTMPI
         call MPI_ALLREDUCE(npart_cpu,npart_all,ncpu,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,info)
         npart_cpu(1) = npart_all(1)
+#else
+        npart_all       = npart
 #endif
+        if(myid==1)then
+           write(*,*) ' npart_tot -> ',sum(npart_all)
+           write(*,'(A50)')"__________________________________________________"
+           close(1)
+        endif
         do icpu=2,ncpu
            npart_cpu(icpu)=npart_cpu(icpu-1)+npart_all(icpu)
         end do
         if(debug)write(*,*)'npart=',npart,'/',npart_cpu(ncpu)
+        ifout = ic_ifout
+        t = ic_t_restart
         ! DICE patch
 
      case ('gadget')

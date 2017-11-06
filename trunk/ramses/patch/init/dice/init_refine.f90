@@ -1,58 +1,3 @@
-!========================================================================================
-!== Patch DICE
-!== Initial conditions to setup 1 or more galaxies computed from the DICE software
-!== Valentin Perret - October 2014
-!========================================================================================
-!==  Namelist settings:
-!==
-!==	ic_file     : Gadget1 file in the IC directory
-!== 	IG_rho      : Density of the intergalactic medium
-!== 	IG_T2       : Temperature of the intergalactic medium
-!== 	IG_metal    : Metallicity of the intergalactic medium
-!== 
-!========================================================================================
-
-
-module dice_commons
-  use amr_commons
-  use hydro_commons
-  
-  ! particle data
-  character(len=512)::ic_file, ic_format
-  ! misc  
-  real(dp)::IG_rho         = 1.0D-5
-  real(dp)::IG_T2          = 1.0D7
-  real(dp)::IG_metal       = 0.01
-  real(dp)::ic_scale_pos   = 1.0
-  real(dp)::ic_scale_vel   = 1.0
-  real(dp)::ic_scale_mass  = 1.0
-  real(dp)::ic_scale_u     = 1.0
-  real(dp)::ic_scale_age   = 1.0
-  real(dp)::ic_scale_metal = 1.0
-  real(dp)::ic_t_restart   = 0.0D0
-  integer::ic_ifout        = 1
-  integer::ic_nfile        = 1
-  real(dp),dimension(1:3)::ic_mag_ini= (/ 0.0, 0.0, 0.0 /)
-  real(dp),dimension(1:3)::ic_center = (/ 0.0, 0.0, 0.0 /)
-  character(len=4)::ic_head_name  = 'HEAD'
-  character(len=4)::ic_pos_name   = 'POS '
-  character(len=4)::ic_vel_name   = 'VEL '
-  character(len=4)::ic_id_name    = 'ID  '
-  character(len=4)::ic_mass_name  = 'MASS'
-  character(len=4)::ic_u_name     = 'U   '
-  character(len=4)::ic_metal_name = 'Z   '
-  character(len=4)::ic_age_name   = 'AGE '
-  ! Gadget units in cgs
-  real(dp)::gadget_scale_l = 3.085677581282D21
-  real(dp)::gadget_scale_v = 1.0D5
-  real(dp)::gadget_scale_m = 1.9891D43
-  real(dp)::gadget_scale_t = 1.0D6*365*24*3600
-  real(dp),allocatable,dimension(:)::up
-  logical::dice_init       = .false.
-  logical::amr_struct      = .false.
-
-end module dice_commons
-
 !################################################################
 !################################################################
 !################################################################
@@ -60,6 +5,7 @@ end module dice_commons
 subroutine init_refine
   use amr_commons
   use pm_commons
+  use dice_commons
   implicit none
   !-------------------------------------------
   ! This routine builds the initial AMR grid
@@ -118,6 +64,10 @@ subroutine init_refine_2
   use dice_commons
   implicit none
   integer::ilevel,i,ivar
+  real(dp)::scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2
+  real(dp)::eps_star2
+
+  call units(scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2)
 
   if(filetype.eq.'grafic')return
   if(myid==1.and.amr_struct) then
@@ -217,6 +167,14 @@ subroutine init_refine_2
      call merge_tree_fine(ilevel)
   end do
   deallocate(up)
+  if(sf_virial)then
+     eps_star2=eps_star
+     eps_star=0d0
+     do ilevel=nlevelmax,levelmin,-1
+        call star_formation(ilevel)
+     enddo
+     eps_star=eps_star2
+  endif
   dice_init=.false.
   ! ----------
 
@@ -228,9 +186,7 @@ subroutine init_refine_2
         call upload_fine(ilevel)
      end do
   endif
-#endif  
-  ! DICE restart time
-  t=ic_t_restart
+#endif
 
 end subroutine init_refine_2
 !################################################################
@@ -329,14 +285,50 @@ subroutine kill_gas_part(ilevel)
   call MPI_ALLREDUCE(npart_cpu,npart_cpu_all,ncpu,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,info)
 #endif
   npart_all=sum(npart_cpu_all(1:ncpu))
-  if(myid==1)then
-     write(*,'(A50)')"__________________________________________________"
-     write(*,'(A,I15)')' Gas particles deleted ->',npart_all
-     write(*,'(A50)')"__________________________________________________"
+  if(npart_all>0) then
+     if(myid==1) then
+        write(*,'(A50)')"__________________________________________________"
+        write(*,'(A,I15)')' Gas particles deleted ->',npart_all
+        write(*,'(A50)')"__________________________________________________"
+     endif
   endif
-  do ipart=1,npart
-    idp(ipart) = idp(ipart)-1
-  enddo
+npart_cpu(myid)=npart
+#ifndef WITHOUTMPI
+  ! Give an array of number of gas on each cpu available to all cpus
+  call MPI_ALLREDUCE(npart_cpu,npart_cpu_all,ncpu,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,info)
+#endif
+  npart_all=sum(npart_cpu_all(1:ncpu))
+  if(npart_all>0) then
+     if(myid==1) then
+        write(*,'(A50)')"__________________________________________________"
+        write(*,'(A,I15)')' Remaining particles ->',npart_all
+        write(*,'(A50)')"__________________________________________________"
+     endif
+  endif
+
+  do icpu=1,ncpu
+     igrid=headl(icpu,ilevel)
+     ig=0
+     ip=0
+     ! Loop over grids
+     do jgrid=1,numbl(icpu,ilevel)
+        npart1=numbp(igrid)  ! Number of particles in the grid
+        npart2=0        
+        ! Count gas particles
+        if(npart1>0)then
+           ipart=headp(igrid)
+           ! Loop over particles
+           do jpart=1,npart1
+              ! Save next particle   <--- Very important !!!
+              next_part=nextp(ipart)
+              if(idp(ipart).gt.0) idp(ipart)=idp(ipart)-1
+              ipart=next_part  ! Go to next particle
+           end do
+           npart_cpu(myid)=npart_cpu(myid)+npart2
+        endif
+     end do
+  end do
+
 
 111 format('   Entering kill_gas_part for level ',I2)
 !---------------------------------------------

@@ -78,7 +78,7 @@ subroutine timer (label, cmd)
   end if
 end subroutine
 !=======================================================================
-subroutine finalize_timer
+subroutine output_timer(write_file, filename)
   use amr_parameters
   use amr_commons
   use timer_m
@@ -90,21 +90,29 @@ subroutine finalize_timer
   real(kind=8), dimension(ncpu) :: vtime
   integer,      dimension(ncpu) :: all_ntimer
   logical,      dimension(ncpu) :: gprint_timer
-  integer      :: imn, imx, mpi_err, icpu
-  logical      :: o, print_timer
+  integer      :: imn, imx, mpi_err, icpu, i
+  logical      :: o, print_timer, write_file
+  integer      :: ilun=11
+  character(LEN=80)::filename, fileloc !Optional for writing timing info
 !-----------------------------------------------------------------------
   o = myid == 1
   total = 1e-9
-  if (o .and. ncpu==1) write (*,'(/a,i7,a)') '     seconds         %    STEP (rank=',myid,')'
-  do itimer = 1,ntimer
-     total = total + time(itimer)
+  if (.not. write_file) ilun=6 ! 6 = std output
+  if (o .and. write_file) then
+     fileloc=TRIM(filename) ! Open file for timing info
+     open(unit=ilun,file=fileloc,form='formatted')
+  endif
+     
+  if (o .and. ncpu==1) write (ilun,'(/a,i7,a)') '     seconds         %    STEP (rank=',myid,')'
+  do i = 1,ntimer
+     total = total + time(i)
   end do
   if (ncpu==1) then
-     do itimer = 1,ntimer
-        if (o .and. time(itimer)/total > 0.001) write (*,'(f12.3,4x,f6.1,4x,a24)') &
-          time(itimer), 100.*time(itimer)/total,labels(itimer)
+     do i = 1,ntimer
+        if (o .and. time(i)/total > 0.001) write (ilun,'(f12.3,4x,f6.1,4x,a24)') &
+          time(i), 100.*time(i)/total,labels(i)
      end do
-     if (o) write (*,'(f12.3,4x,f6.1,4x,a)') total, 100., 'TOTAL'
+     if (o) write (ilun,'(f12.3,4x,f6.1,4x,a)') total, 100., 'TOTAL'
   end if
 #ifndef WITHOUTMPI
   if (ncpu > 1) then
@@ -113,14 +121,14 @@ subroutine finalize_timer
      call MPI_GATHER(ntimer,1,MPI_INTEGER,all_ntimer,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_err)
      if (o) then
         if (maxval(all_ntimer) .ne. minval(all_ntimer)) then
-           write (*,*)
-           write (*,*) '--------------------------------------------------------------------'
-           write (*,*) 'Error: Inconsistent number of timers on each rank. Min, max nr:', minval(all_ntimer), maxval(all_ntimer)
-           write (*,*) 'Timing summary below can be misleading'
-           write (*,*) 'Labels of timer on rank==1 :'
-           write (*,*) '--------------------------------------------------------------------'
-           do itimer=1,ntimer
-              write(*,'(i3,1x,a)') itimer, labels(itimer)
+           write (ilun,*)
+           write (ilun,*) '--------------------------------------------------------------------'
+           write (ilun,*) 'Error: Inconsistent number of timers on each rank. Min, max nr:', minval(all_ntimer), maxval(all_ntimer)
+           write (ilun,*) 'Timing summary below can be misleading'
+           write (ilun,*) 'Labels of timer on rank==1 :'
+           write (ilun,*) '--------------------------------------------------------------------'
+           do i=1,ntimer
+              write(ilun,'(i3,1x,a)') i, labels(i)
            enddo
         endif
         ! Find first occurence of a rank with a different number of timers -- if it exists
@@ -135,36 +143,37 @@ subroutine finalize_timer
      endif
      call MPI_SCATTER(gprint_timer,1,MPI_LOGICAL,print_timer,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_err)
      if (print_timer) then
-        write (*,*)
-        write (*,*) 'Labels of timer on rank==',myid
-        write (*,*) '--------------------------------------------------------------------'
-        do itimer=1,ntimer
-           write(*,'(i3,1x,a)') itimer, labels(itimer)
+        write (ilun,*)
+        write (ilun,*) 'Labels of timer on rank==',myid
+        write (ilun,*) '--------------------------------------------------------------------'
+        do i=1,ntimer
+           write(ilun,'(i3,1x,a)') i, labels(i)
         enddo
-        write (*,*)
+        write (ilun,*)
      endif
 
      call MPI_BARRIER(MPI_COMM_WORLD,mpi_err)
      call MPI_ALLREDUCE(total,gtotal,1,MPI_REAL8,MPI_SUM,MPI_COMM_WORLD,mpi_err)
      gtotal = gtotal / ncpu
 
-     if (o) write (*,*) '--------------------------------------------------------------------'
-     if (o) write (*,'(/a)') '     minimum       average       maximum' // &
+     if (o) write (ilun,*) '--------------------------------------------------------------------'
+     if (o) write (ilun,'(/a)') '     minimum       average       maximum' // &
                   '  standard dev        std/av       %   rmn   rmx  TIMER'
-     do itimer = 1,ntimer
-        call MPI_GATHER(real(time(itimer),kind=8),1,MPI_REAL8,vtime,1,MPI_REAL8,0,MPI_COMM_WORLD,mpi_err)
+     do i = 1,ntimer
+        call MPI_GATHER(real(time(i),kind=8),1,MPI_REAL8,vtime,1,MPI_REAL8,0,MPI_COMM_WORLD,mpi_err)
         if (o) then
            if (maxval(vtime)/gtotal > 0.001) then
               avtime  = sum(vtime) / ncpu ! average time used
               imn     = minloc(vtime,1)
               imx     = maxloc(vtime,1)
               rmstime = sqrt(sum((vtime - avtime)**2)/ncpu)
-              write (*,'(5(f12.3,2x),f6.1,2x,2i4,4x,a24)') &
-                 vtime(imn), avtime, vtime(imx), rmstime, rmstime/avtime, 100.*avtime/gtotal, imn, imx, labels(itimer)
+              write (ilun,'(5(f12.3,2x),f6.1,2x,2i4,4x,a24)') &
+                 vtime(imn), avtime, vtime(imx), rmstime, rmstime/avtime, 100.*avtime/gtotal, imn, imx, labels(i)
            endif
         endif
      end do
-     if (o) write (*,'(f12.3,4x,f6.1,4x,a)') total, 100., 'TOTAL'
+     if (o) write (ilun,'(f12.3,4x,f6.1,4x,a)') total, 100., 'TOTAL'
+     if (o) close(ilun)
   endif
 #endif
 end subroutine
@@ -232,12 +241,12 @@ subroutine update_time(ilevel)
      end if
      epot_tot_old=epot_tot
      aexp_old=aexp
-     if(const==0.0D0)then
-        const=epot_tot+ekin_tot  ! initial total energy
+     if(einit==0.0D0)then
+        einit=epot_tot+ekin_tot  ! initial total energy
         econs=0.0D0
      else
-        econs=(ekin_tot+epot_tot-epot_tot_int-const) / &
-             &(-(epot_tot-epot_tot_int-const)+ekin_tot)
+        econs=(ekin_tot+epot_tot-epot_tot_int-einit) / &
+             &(-(epot_tot-epot_tot_int-einit)+ekin_tot)
      end if
 
      if(mod(nstep_coarse,ncontrol)==0.or.output_done)then
@@ -255,7 +264,7 @@ subroutine update_time(ilevel)
            ! Output mass and energy conservation to screen
            !----------------------------------------------
            if(cooling.or.pressure_fix)then
-              write(*,778)nstep_coarse,econs,epot_tot,ekin_tot,eint_tot
+              write(*,778)nstep_coarse,mcons,econs,epot_tot,ekin_tot,eint_tot
            else
               write(*,777)nstep_coarse,mcons,econs,epot_tot,ekin_tot
            end if
@@ -333,11 +342,11 @@ subroutine update_time(ilevel)
      texp = t
   end if
 
-777 format(' Main step=',i6,' mcons=',1pe9.2,' econs=',1pe9.2, &
+777 format(' Main step=',i7,' mcons=',1pe9.2,' econs=',1pe9.2, &
          & ' epot=',1pe9.2,' ekin=',1pe9.2)
-778 format(' Main step=',i6,' econs=',1pe9.2, &
+778 format(' Main step=',i7,' mcons=',1pe9.2,' econs=',1pe9.2, &
          & ' epot=',1pe9.2,' ekin=',1pe9.2,' eint=',1pe9.2)
-888 format(' Fine step=',i6,' t=',1pe12.5,' dt=',1pe10.3, &
+888 format(' Fine step=',i7,' t=',1pe12.5,' dt=',1pe10.3, &
          & ' a=',1pe10.3,' mem=',0pF4.1,'% ',0pF4.1,'%')
 999 format(' Level ',I2,' has ',I10,' grids (',3(I8,','),')')
  
@@ -350,8 +359,9 @@ subroutine clean_stop
   include 'mpif.h'
 #endif
   integer::info
+  character(LEN=80)::str
 
-  call finalize_timer
+  call output_timer(.false., str)
 
 #ifndef WITHOUTMPI
   call MPI_FINALIZE(info)
@@ -380,9 +390,9 @@ subroutine writemem(usedmem)
      write(*,997)usedmem/1024.
   endif
 
-997 format(' Used memory:',F6.1,' kb')
-998 format(' Used memory:',F6.1,' Mb')
-999 format(' Used memory:',F6.1,' Gb')
+997 format(' Used memory:',F9.1,' kb')
+998 format(' Used memory:',F9.1,' Mb')
+999 format(' Used memory:',F9.3,' Gb')
 
 end subroutine writemem
 
@@ -524,7 +534,7 @@ SUBROUTINE getAgeGyr(t_birth_proper, age)
   real(dp):: t_birth_proper, age
   real(dp), parameter:: yr = 3.15569d+07
   real(dp),save:: scale_t_Gyr
-  logical::scale_init=.false.
+  logical,save::scale_init=.false.
   real(dp):: scale_nH, scale_T2, scale_l, scale_d, scale_t, scale_v
   if( .not. scale_init) then 
      ! The timescale has not been initialized

@@ -31,14 +31,14 @@ module rt_cooling_module
   real(dp)::T_min, T_frac, x_min, x_frac, Np_min, Np_frac, Fp_min, Fp_frac
 
   integer,parameter::iIR=1                       !          IR group index
-  integer::iIRtrapVar=1                          ! IRtrap passScalar index
+  integer::iIRtrapVar=1                          ! Trapped IR energy index
   ! Namelist parameters:
   logical::isHe=.true.
   logical::is_mu_H2=.false.
   logical::rt_isoPress=.false.         ! Use cE, not F, for rad. pressure
   real(dp)::rt_pressBoost=1d0          ! Boost on RT pressure            
   logical::rt_isIR=.false.             ! Using IR scattering on dust?    
-  logical::rt_isIRtrap=.false.         ! IR trapping in passive scalar?  
+  logical::rt_isIRtrap=.false.         ! IR trapping in NENER variable?  
   logical::is_kIR_T=.false.            ! k_IR propto T^2?               
   logical::rt_T_rad=.false.            ! Use T_gas = T_rad
   logical::rt_vc=.false.               ! (semi-) relativistic RT
@@ -79,7 +79,7 @@ SUBROUTINE rt_set_model(Nmodel, J0in_in, J0min_in, alpha_in              &
   real(kind=8) :: J0in_in, zreioniz_in, J0min_in, alpha_in, normfacJ0_in
   real(kind=8) :: astart_sim, T2_sim, h, omegab, omega0, omegaL
   integer  :: Nmodel, correct_cooling, realistic_ne, ig
-  real(kind=8) :: astart=0.0001, aend, dasura, T2end, mu, ne
+  real(kind=8) :: astart=0.0001, aend, dasura, T2end=T2_min_fix, mu, ne
 !-------------------------------------------------------------------------
   if(myid==1) write(*,*) &
        '==================RT momentum pressure is turned ON=============='
@@ -113,8 +113,13 @@ SUBROUTINE rt_set_model(Nmodel, J0in_in, J0min_in, alpha_in              &
 
   call update_rt_c
   call init_UV_background
-  call update_UVrates(astart_sim)! In case of aexp_nocosmo
-  call init_coolrates_tables(astart_sim)
+  if(cosmo) then
+     call update_UVrates(aexp)
+     call init_coolrates_tables(aexp)
+  else
+     call update_UVrates(astart_sim)
+     call init_coolrates_tables(astart_sim)
+  endif
 
   if(nrestart==0 .and. cosmo)                                            &
        call rt_evol_single_cell(astart,aend,dasura,h,omegab,omega0       &
@@ -137,12 +142,12 @@ SUBROUTINE update_UVrates(aexp)
   
   call inp_UV_rates_table(1./aexp - 1., UVrates, .true.)
 
-  if(myid==1) then
-     write(*,*) 'The UV rates have changed to:'
-     do i=1,nIons
-        write(*,910) UVrates(i,:)
-     enddo
-  endif
+  !if(myid==1) then
+  !   write(*,*) 'The UV rates have changed to:'
+  !   do i=1,nIons
+  !      write(*,910) UVrates(i,:)
+  !   enddo
+  !endif
 910 format (1pe21.6, ' s-1', 1pe21.6,' erg s-1')
 
 END SUBROUTINE update_UVrates
@@ -349,15 +354,24 @@ contains
     if(rt .and. nGroups .gt. 0) then
        kAbs_loc = kappaAbs
        kSc_loc  = kappaSc
-       if(is_kIR_T) then ! k_IR depends on T
-          ! Special stuff for Krumholz/Davis experiment
-          if(rt_T_rad) then  ! Use radiation temperature for kappa
-             E_rad = group_egy_erg(iIR) * dNp(iIR)
-             TR = max(T2_min_fix,(E_rad*rt_c_fraction/a_r)**0.25)
+       if(is_kIR_T) then                           ! k_IR depends on T_rad
+          ! For the radiation temperature,  weigh the energy in each group
+          ! by its opacity over IR opacity (derived from IR temperature)
+          E_rad = group_egy_erg(iIR) * dNp(iIR)
+          TR = max(0d0,(E_rad*rt_c_fraction/a_r)**0.25)   ! IR temperature
+          kAbs_loc(iIR) = kappaAbs(iIR) * (TR/10d0)**2
+          do iGroup=1,nGroups
+             if(i .ne. iIR)                                              &
+                  E_rad = E_rad + kAbs_loc(iGroup) / kAbs_loc(iIR)       &
+                                * group_egy_erg(iGroup) * dNp(iGroup)
+          end do
+          TR = max(0d0,(E_rad*rt_c_fraction/a_r)**0.25) ! Rad. temperature
+          if(rt_T_rad) then ! Use radiation temperature for everything
              dT2 = TR/mu ;   TK = TR
           endif
-          kAbs_loc(iIR) = kappaAbs(iIR) * (TK/10d0)**2
-          kSc_loc(iIR)  = kappaSc(iIR)  * (TK/10d0)**2
+          ! Set the IR opacities according to the rad. temperature:
+          kAbs_loc(iIR) = kappaAbs(iIR) * (TR/10d0)**2 * exp(-TR/1d3)
+          kSc_loc(iIR)  = kappaSc(iIR)  * (TR/10d0)**2 * exp(-TR/1d3)
        endif
        ! Set dust absorption and scattering rates [s-1]:
        dustAbs(:)  = kAbs_loc(:) *rho*Zsolar(icell)*rt_c_cgs
@@ -820,8 +834,9 @@ SUBROUTINE rt_evol_single_cell(astart,aend,dasura,h,omegab,omega0,omegaL &
   Np(:,1)=0. ; Fp(:,:,1)=0.                  ! Photon densities and fluxes
   dNpdt(:,1)=0. ; dFpdt(:,:,1)=0.                              
   do while (aexp < aend)
-     if(haardt_madau) call inp_UV_rates_table(1./aexp-1., UVrates, .true.)
-
+     call update_UVrates(aexp)
+     call update_coolrates_tables(aexp)
+     
      daexp = dasura*aexp
      dt_cool = daexp                                                     &
              / (aexp*100.*h*3.2408608e-20)                               &

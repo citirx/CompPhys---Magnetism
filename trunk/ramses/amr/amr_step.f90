@@ -13,15 +13,16 @@ recursive subroutine amr_step(ilevel,icount)
   implicit none
 #ifndef WITHOUTMPI
   include 'mpif.h'
+  integer::mpi_err
 #endif
-  integer::ilevel,icount
+  integer::ilevel,icount,ilev
   !-------------------------------------------------------------------!
   ! This routine is the adaptive-mesh/adaptive-time-step main driver. !
   ! Each routine is called using a specific order, don't change it,   !
   ! unless you check all consequences first                           !
   !-------------------------------------------------------------------!
   integer::i,idim,ivar
-  logical::ok_defrag
+  logical::ok_defrag,output_now_all
   logical,save::first_step=.true.
 
   if(numbtot(1,ilevel)==0)return
@@ -32,7 +33,7 @@ recursive subroutine amr_step(ilevel,icount)
   ! Make new refinements and update boundaries
   !-------------------------------------------
                                call timer('refine','start')
-  if(levelmin.lt.nlevelmax .and..not. static)then
+  if(levelmin.lt.nlevelmax .and.(.not.static.or.(nstep_coarse_old.eq.nstep_coarse.and.restart_remap)))then
      if(ilevel==levelmin.or.icount>1)then
         do i=ilevel,nlevelmax
            if(i>levelmin)then
@@ -88,13 +89,19 @@ recursive subroutine amr_step(ilevel,icount)
   !--------------------------
   ! Load balance
   !--------------------------
-                               call timer('loadbalance','start')
+                               call timer('load balance','start')
   ok_defrag=.false.
   if(levelmin.lt.nlevelmax)then
      if(ilevel==levelmin)then
         if(nremap>0)then
            ! Skip first load balance because it has been performed before file dump
            if(nrestart>0.and.first_step)then
+              if(nrestart.eq.nrestart_quad) restart_remap=.true.
+              if(restart_remap) then
+                 call load_balance
+                 call defrag
+                 ok_defrag=.true.
+              endif
               first_step=.false.
            else
               if(MOD(nstep_coarse,nremap)==0)then
@@ -123,7 +130,15 @@ recursive subroutine amr_step(ilevel,icount)
   ! Output results to files
   !------------------------
   if(ilevel==levelmin)then
-     if(mod(nstep_coarse,foutput)==0.or.aexp>=aout(iout).or.t>=tout(iout).or.output_now.EQV..true.)then
+
+#ifdef WITHOUTMPI
+     output_now_all = output_now
+#else
+     ! check if any of the processes received a signal for output
+     call MPI_BARRIER(MPI_COMM_WORLD,mpi_err)
+     call MPI_ALLREDUCE(output_now,output_now_all,1,MPI_LOGICAL,MPI_LOR,MPI_COMM_WORLD,mpi_err)
+#endif
+     if(mod(nstep_coarse,foutput)==0.or.aexp>=aout(iout).or.t>=tout(iout).or.output_now_all.EQV..true.)then
                                call timer('io','start')
         if(.not.ok_defrag)then
            call defrag
@@ -132,19 +147,18 @@ recursive subroutine amr_step(ilevel,icount)
         call dump_all
 
         ! Run the clumpfinder, (produce output, don't keep arrays alive on output)
+        ! CAREFUL: create_output is used to destinguish between the case where 
+        ! the clumpfinder is called from create_sink or directly from amr_step.
         if(clumpfind .and. ndim==3) call clump_finder(.true.,.false.)
 
         ! Dump lightcone
         if(lightcone) call output_cone()
 
-        if (output_now.EQV..true.) then
+        if (output_now_all.EQV..true.) then
           output_now=.false.
         endif
 
      endif
-
-     ! Important can't be done in sink routines because it must be done after dump all
-     if(sink)acc_rate=0.
 
   endif
 
@@ -154,7 +168,7 @@ recursive subroutine amr_step(ilevel,icount)
   if(movie) then
      if(imov.le.imovout)then 
         if(aexp>=amovout(imov).or.t>=tmovout(imov))then
-                               call timer('io','start')
+                               call timer('movie','start')
            call output_frame()
         endif
      endif
@@ -179,6 +193,7 @@ recursive subroutine amr_step(ilevel,icount)
                                call timer('poisson','start')
      !save old potential for time-extrapolation at level boundaries
      call save_phi_old(ilevel)
+                               call timer('rho','start')
      call rho_fine(ilevel,icount)
   endif
 
@@ -223,7 +238,11 @@ recursive subroutine amr_step(ilevel,icount)
      ! Synchronize remaining particles for gravity
      if(pic)then
                                call timer('particles','start')
-        call synchro_fine(ilevel)
+        if(static_dm.or.static_stars)then
+           call synchro_fine_static(ilevel)
+        else
+           call synchro_fine(ilevel)
+        end if
      end if
 
      if(hydro)then
@@ -311,11 +330,11 @@ recursive subroutine amr_step(ilevel,icount)
                                call timer('sinks','start')
      call grow_sink(ilevel,.false.)
   end if
-  
+
   !-----------
   ! Hydro step
   !-----------
-  if(hydro)then
+  if((hydro).and.(.not.static_gas))then
 
      ! Hyperbolic solver
                                call timer('hydro - godunov','start')
@@ -354,7 +373,6 @@ recursive subroutine amr_step(ilevel,icount)
 
   endif
 
-  
   !---------------------
   ! Do RT/Chemistry step
   !---------------------
@@ -381,7 +399,9 @@ recursive subroutine amr_step(ilevel,icount)
   endif
 #else
                                call timer('cooling','start')
-  if(neq_chem.or.cooling.or.T2_star>0.0)call cooling_fine(ilevel)
+  if((hydro).and.(.not.static_gas)) then
+    if(neq_chem.or.cooling.or.T2_star>0.0)call cooling_fine(ilevel)
+  endif
 #endif
   
   !---------------
@@ -389,19 +409,23 @@ recursive subroutine amr_step(ilevel,icount)
   !---------------
   if(pic)then
                                call timer('particles','start')
-     call move_fine(ilevel) ! Only remaining particles
+     if(static_dm.or.static_stars)then
+        call move_fine_static(ilevel) ! Only remaining particles
+     else
+        call move_fine(ilevel) ! Only remaining particles
+     end if
   end if
   
   !----------------------------------
   ! Star formation in leaf cells only
   !----------------------------------
                                call timer('feedback','start')
-  if(hydro.and.star)call star_formation(ilevel)
+  if(hydro.and.star.and.(.not.static_gas))call star_formation(ilevel)
 
   !---------------------------------------
   ! Update physical and virtual boundaries
   !---------------------------------------
-  if(hydro)then
+  if((hydro).and.(.not.static_gas))then
                                call timer('hydro - ghostzones','start')
 #ifdef SOLVERmhd
      do ivar=1,nvar+3
@@ -419,7 +443,7 @@ recursive subroutine amr_step(ilevel,icount)
 
 #ifdef SOLVERmhd
   ! Magnetic diffusion step
- if(hydro)then
+  if((hydro).and.(.not.static_gas))then
      if(eta_mag>0d0.and.ilevel==levelmin)then
                                call timer('hydro - diffusion','start')
         call diffusion
@@ -431,7 +455,7 @@ recursive subroutine amr_step(ilevel,icount)
   ! Compute refinement map
   !-----------------------
                                call timer('flag','start')
-  if(.not.static) call flag_fine(ilevel,icount)
+  if(.not.static.or.(nstep_coarse_old.eq.nstep_coarse.and.restart_remap)) call flag_fine(ilevel,icount)
 
   !----------------------------
   ! Merge finer level particles
@@ -541,8 +565,10 @@ subroutine rt_step(ilevel)
      ! Set rtuold equal to rtunew
      call rt_set_uold(ilevel)
 
+                               call timer('cooling','start')
      if(neq_chem.or.cooling.or.T2_star>0.0)call cooling_fine(ilevel)
-     
+                               call timer('radiative transfer','start')    
+
      do ivar=1,nrtvar
         call make_virtual_fine_dp(rtuold(1,ivar),ilevel)
      end do

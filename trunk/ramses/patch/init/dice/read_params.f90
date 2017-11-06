@@ -1,8 +1,67 @@
+module dice_commons
+  use amr_commons
+  use hydro_commons
+  
+  ! particle data
+  character(len=512)::ic_file, ic_format
+  ! misc  
+  real(dp)::IG_rho         = 1.0D-5
+  real(dp)::IG_T2          = 1.0D7
+  real(dp)::IG_metal       = 0.01
+  real(dp)::ic_scale_pos   = 1.0
+  real(dp)::ic_scale_vel   = 1.0
+  real(dp)::ic_scale_mass  = 1.0
+  real(dp)::ic_scale_u     = 1.0
+  real(dp)::ic_scale_age   = 1.0
+  real(dp)::ic_scale_metal = 1.0
+  real(dp)::ic_t_restart   = 0.0D0
+  integer::ic_mask_ivar    = 0
+  real(dp)::ic_mask_min    = 1d40
+  real(dp)::ic_mask_max    = -1d40
+  integer::ic_mask_ptype   = -1
+  integer::ic_ifout        = 1
+  integer::ic_nfile        = 1
+  integer,dimension(1:6)::ic_skip_type        = -1
+  integer,dimension(1:6)::cosmo_add_gas_index = -1
+  real(dp),dimension(1:3)::ic_mag_const = (/ 0.0, 0.0, 0.0 /)
+  real(dp),dimension(1:3)::ic_center    = (/ 0.0, 0.0, 0.0 /)
+  character(len=4)::ic_head_name  = 'HEAD'
+  character(len=4)::ic_pos_name   = 'POS '
+  character(len=4)::ic_vel_name   = 'VEL '
+  character(len=4)::ic_id_name    = 'ID  '
+  character(len=4)::ic_mass_name  = 'MASS'
+  character(len=4)::ic_u_name     = 'U   '
+  character(len=4)::ic_metal_name = 'Z   '
+  character(len=4)::ic_age_name   = 'AGE '
+  ! Gadget units in cgs
+  real(dp)::gadget_scale_l = 3.085677581282D21
+  real(dp)::gadget_scale_v = 1.0D5
+  real(dp)::gadget_scale_m = 1.9891D43
+  real(dp)::gadget_scale_t = 1.0D6*365*24*3600
+  real(dp),allocatable,dimension(:)::up
+  real(dp),allocatable,dimension(:)::maskp
+  logical::dice_init       = .false.
+  logical::amr_struct      = .false.
+  ! magnetic
+  integer,parameter::MAXGAL= 32
+  real(dp),dimension(1:MAXGAL)::ic_mag_center_x = 0.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_center_y = 0.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_center_z = 0.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_axis_x   = 0.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_axis_y   = 0.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_axis_z   = 1.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_scale_R  = 1.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_scale_H  = 1.0
+  real(dp),dimension(1:MAXGAL)::ic_mag_scale_B  = 0.0
+
+end module dice_commons
+
 subroutine read_params
   use amr_commons
   use pm_parameters
   use poisson_parameters
   use hydro_parameters
+  use dice_commons
   implicit none
 #ifndef WITHOUTMPI
   include 'mpif.h'
@@ -11,14 +70,13 @@ subroutine read_params
   ! Local variables
   !--------------------------------------------------
   integer::i,narg,iargc,ierr,levelmax
-  character(LEN=80)::infile, info_file
+  character(LEN=80)::infile
   character(LEN=80)::cmdarg
-  character(LEN=5)::nchar
   integer(kind=8)::ngridtot=0
   integer(kind=8)::nparttot=0
   real(kind=8)::delta_tout=0,tend=0
   real(kind=8)::delta_aout=0,aend=0
-  logical::nml_ok, info_ok
+  logical::nml_ok
   integer,parameter::tag=1134
   integer::dummy_io,info2
   !--------------------------------------------------
@@ -42,6 +100,16 @@ subroutine read_params
        & ,theta_camera,phi_camera,dtheta_camera,dphi_camera,focal_camera,dist_camera,ddist_camera &
        & ,perspective_camera,smooth_frame,shader_frame,tstart_theta_camera,tstart_phi_camera &
        & ,tend_theta_camera,tend_phi_camera,method_frame,varmin_frame,varmax_frame
+  namelist/dice_params/ ic_file,ic_nfile,ic_format,IG_rho,IG_T2,IG_metal &
+       & ,ic_head_name,ic_pos_name,ic_vel_name,ic_id_name,ic_mass_name &
+       & ,ic_u_name,ic_metal_name,ic_age_name &
+       & ,gadget_scale_l, gadget_scale_v, gadget_scale_m ,gadget_scale_t &
+       & ,ic_scale_pos,ic_scale_vel,ic_scale_mass,ic_scale_u,ic_scale_age &
+       & ,ic_scale_metal,ic_center,ic_ifout,amr_struct,ic_t_restart,ic_mag_const &
+       & ,ic_mag_center_x,ic_mag_center_y,ic_mag_center_z &
+       & ,ic_mag_axis_x,ic_mag_axis_y,ic_mag_axis_z &
+       & ,ic_mag_scale_R,ic_mag_scale_H,ic_mag_scale_B,cosmo_add_gas_index,ic_skip_type &
+       & ,ic_mask_ivar,ic_mask_min,ic_mask_max,ic_mask_ptype
 
   ! MPI initialization
 #ifndef WITHOUTMPI
@@ -96,9 +164,7 @@ subroutine read_params
   if(IOGROUPSIZE>0.or.IOGROUPSIZECONE>0.or.IOGROUPSIZEREP>0)write(*,*)' '
 
   ! Write information about git version
-#ifndef CRAY
   call write_gitinfo
-#endif
 
   ! Read namelist filename from command line argument
   narg = iargc()
@@ -162,6 +228,9 @@ subroutine read_params
   rewind(1)
   read(1,NML=poisson_params,END=81)
 81 continue
+  rewind(1)
+  read(1,NML=dice_params,END=106)
+106 continue
 
   !-------------------------------------------------
   ! Read optional nrestart command-line argument
@@ -169,22 +238,6 @@ subroutine read_params
   if (myid==1 .and. narg == 2) then
      CALL getarg(2,cmdarg)
      read(cmdarg,*) nrestart
-  endif
-
-  if (myid==1 .and. nrestart .gt. 0) then
-     call title(nrestart,nchar)
-     info_file='output_'//TRIM(nchar)//'/info_'//TRIM(nchar)//'.txt'
-     inquire(file=info_file, exist=info_ok) 
-     do while(.not. info_ok .and. nrestart .gt. 1)
-        nrestart = nrestart - 1
-        call title(nrestart,nchar)
-        info_file='output_'//TRIM(nchar)//'/info_'//TRIM(nchar)//'.txt'
-        inquire(file=info_file, exist=info_ok) 
-     enddo   
-     if (.not. info_ok) then
-         write(*,*) "Error: Could not find restart file"
-         call clean_stop
-     endif
   endif
 
 #ifndef WITHOUTMPI
@@ -209,17 +262,17 @@ subroutine read_params
   endif
   noutput=MIN(noutput,MAXOUT)
   if(imovout>0) then
-     allocate(tmovout(0:imovout))
-     allocate(amovout(0:imovout))
+     allocate(tmovout(1:imovout))
+     allocate(amovout(1:imovout))
      tmovout=1d100
      amovout=1d100
      if(tendmov>0)then
-        do i=0,imovout
+        do i=1,imovout
            tmovout(i)=(tendmov-tstartmov)*dble(i)/dble(imovout)+tstartmov
         enddo
      endif
      if(aendmov>0)then
-        do i=0,imovout
+        do i=1,imovout
            amovout(i)=(aendmov-astartmov)*dble(i)/dble(imovout)+astartmov
         enddo
      endif

@@ -22,6 +22,9 @@ subroutine read_hydro_params(nml_ok)
 #if NENER>0
        & ,prad_region &
 #endif
+#if NVAR>NDIM+2+NENER
+       & ,var_region &
+#endif
        & ,d_region,u_region,v_region,w_region,p_region
   namelist/hydro_params/gamma,courant_factor,smallr,smallc &
        & ,niter_riemann,slope_type,difmag &
@@ -37,13 +40,34 @@ subroutine read_hydro_params(nml_ok)
   namelist/boundary_params/nboundary,bound_type &
        & ,ibound_min,ibound_max,jbound_min,jbound_max &
        & ,kbound_min,kbound_max &
+#if NENER>0
+       & ,prad_bound &
+#endif
+#if NVAR>NDIM+2+NENER
+       & ,var_bound &
+#endif
        & ,d_bound,u_bound,v_bound,w_bound,p_bound,no_inflow
-  namelist/physics_params/cooling,haardt_madau,metal,isothermal &
+  namelist/physics_params/omega_b,cooling,haardt_madau,metal,isothermal &
        & ,m_star,t_star,n_star,T2_star,g_star,del_star,eps_star,jeans_ncells &
-       & ,eta_sn,yield,rbubble,f_ek,ndebris,f_w,mass_gmc,kappa_IR &
-       & ,J21,a_spec,z_ave,z_reion,ind_rsink,delayed_cooling &
+       & ,eta_sn,eta_ssn,yield,rbubble,f_ek,ndebris,f_w,mass_gmc,kappa_IR &
+       & ,J21,a_spec,z_ave,z_reion,ind_rsink,delayed_cooling,T2max &
        & ,self_shielding,smbh,agn &
-       & ,units_density,units_time,units_length,neq_chem,ir_feedback,ir_eff,t_diss,t_sne
+       & ,units_density,units_time,units_length,neq_chem,ir_feedback,ir_eff,t_diss,t_sne &
+       & ,sf_virial,sf_trelax,sf_tdiss,sf_model,sf_log_properties,sf_imf &
+       & ,mass_star_max,mass_sne_min,sf_compressive
+#ifdef grackle
+   namelist/grackle_params/use_grackle,grackle_with_radiative_cooling,grackle_primordial_chemistry,grackle_metal_cooling &
+       & ,grackle_UVbackground,grackle_cmb_temperature_floor,grackle_h2_on_dust,grackle_photoelectric_heating &
+       & ,grackle_use_volumetric_heating_rate,grackle_use_specific_heating_rate,grackle_three_body_rate,grackle_cie_cooling &
+       & ,grackle_h2_optical_depth_approximation,grackle_ih2co,grackle_ipiht,grackle_NumberOfTemperatureBins,grackle_CaseBRecombination &
+       & ,grackle_Compton_xray_heating,grackle_LWbackground_sawtooth_suppression,grackle_NumberOfDustTemperatureBins,grackle_use_radiative_transfer &
+       & ,grackle_radiative_transfer_coupled_rate_solver,grackle_radiative_transfer_intermediate_step,grackle_radiative_transfer_hydrogen_only &
+       & ,grackle_self_shielding_method,grackle_Gamma,grackle_photoelectric_heating_rate,grackle_HydrogenFractionByMass &
+       & ,grackle_DeuteriumToHydrogenRatio,grackle_SolarMetalFractionByMass,grackle_TemperatureStart,grackle_TemperatureEnd &
+       & ,grackle_DustTemperatureStart,grackle_DustTemperatureEnd,grackle_LWbackground_intensity,grackle_UVbackground_redshift_on &
+       & ,grackle_UVbackground_redshift_off,grackle_UVbackground_redshift_fullon,grackle_UVbackground_redshift_drop &
+       & ,grackle_cloudy_electron_fraction_factor,grackle_data_file
+#endif
 
   ! Read namelist file
   rewind(1)
@@ -67,9 +91,20 @@ subroutine read_hydro_params(nml_ok)
   rewind(1)
   read(1,NML=physics_params,END=105)
 105 continue
+#ifdef grackle
+  rewind(1)
+  read(1,NML=grackle_params)
+#endif
 #ifdef ATON
   if(aton)call read_radiation_params(1)
 #endif
+
+  !--------------------------------------------------
+  ! Check for dm only cosmo run
+  !--------------------------------------------------
+  if(.not.hydro)then
+     omega_b = 0.0D0
+  endif
 
   !--------------------------------------------------
   ! Check for star formation
@@ -267,13 +302,42 @@ subroutine read_hydro_params(nml_ok)
   !-----------------------------------
   ! Sort out passive variable indices
   !-----------------------------------
+  inener=ndim+3 ! MUST BE THIS VALUE !!!
   imetal=nener+ndim+3
   idelay=imetal
   if(metal)idelay=imetal+1
-  ixion=idelay
-  if(delayed_cooling)ixion=idelay+1
+  ivirial1=idelay
+  ivirial2=idelay
+  if(delayed_cooling)then
+     ivirial1=idelay+1
+     ivirial2=idelay+1
+  endif
+  if(sf_virial)then
+     if(sf_compressive) ivirial2=ivirial1+1
+  endif
+  ixion=ivirial2
+  if(sf_virial)ixion=ivirial2+1
   ichem=ixion
   if(aton)ichem=ixion+1
+  if(myid==1.and.hydro.and.(nvar>ndim+2)) then
+     write(*,'(A50)')"__________________________________________________"
+     write(*,*) 'Hydro var indices:'
+#if NENER>0
+     write(*,*) '   inener   = ',inener
+#endif
+     if(metal)           write(*,*) '   imetal   = ',imetal
+     if(delayed_cooling) write(*,*) '   idelay   = ',idelay 
+     if(sf_virial)then
+        write(*,*) '   ivirial1 = ',ivirial1
+        if(sf_compressive) write(*,*) '   ivirial2 = ',ivirial2
+     endif
+     if(aton)            write(*,*) '   ixion    = ',ixion
+#ifdef RT
+     if(rt) write(*,*) '   iIons    = ',ichem
+#endif
+     write(*,'(A50)')"__________________________________________________"
+  endif
+
   ! Last variable is ichem
 
 end subroutine read_hydro_params

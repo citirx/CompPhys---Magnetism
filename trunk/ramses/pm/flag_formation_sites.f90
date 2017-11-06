@@ -51,8 +51,8 @@ subroutine flag_formation_sites
   pos=0.0
   if(myid==1 .and. clinfo)write(*,*)'looping over ',nsink,' sinks and marking their clumps'
 
+  ! Block clumps (halo done later) that contain a sink for formation
   if (smbh)then 
-     ! Block clumps (halo done later) that contain a sink for formation
      do j=1,nsink
         pos(1,1:3)=xsink(j,1:3)
         call cmp_cpumap(pos,cc,1)
@@ -67,7 +67,8 @@ subroutine flag_formation_sites
         end if
      end do
   end if
-  ! Block clumps (halo done later) that are closer than twice R_accretion from existing sinks
+
+  ! Block clumps whose centres are closer than twice R_accretion from existing sinks
   do j=1,nsink
      do i=1,npeaks
         rrel=xsink(j,1:ndim)-peak_pos(i,1:ndim)
@@ -89,8 +90,8 @@ subroutine flag_formation_sites
   call boundary_peak_int(occupied)
 #endif
 
+  ! Block halos that contain a blocked clump
   if(smbh)then
-     ! Block halos that contain a blocked clump
      do i=1,npeaks
         if(occupied(i)==1)then
            merge_to=ind_halo(i)
@@ -144,10 +145,13 @@ subroutine flag_formation_sites
         end if
      else
         ok=ok.and.relevance(jj)>0.
+        ok=ok.and.n_cells(jj)>0.
         ok=ok.and.occupied(jj)==0
         ok=ok.and.max_dens(jj)>d_sink
         ok=ok.and.contracting(jj)
         ok=ok.and.Icl_dd(jj)<0.
+        ! Avoid formation of sinks from gas which is only comressed by thermal pressure rather than gravity.
+        ok=ok.and.grav_term(jj) + kinetic_support(jj)<0.d0
         if (ok)then
            pos(1,1:3)=peak_pos(jj,1:3)
            call get_cell_index(cell_index,cell_levl,pos,nlevelmax,1)
@@ -166,7 +170,7 @@ end subroutine flag_formation_sites
 !################################################################
 subroutine compute_clump_properties_round2(xx)
   use amr_commons
-  use hydro_commons, ONLY:uold,gamma,nvar,nener,smallr
+  use hydro_commons, ONLY:uold,gamma,nvar,nener,inener,smallr
   use poisson_commons, ONLY:phi,f
   use clfind_commons
   use pm_commons, ONLY:cont_speed
@@ -190,7 +194,7 @@ subroutine compute_clump_properties_round2(xx)
 
   integer::ipart,ilevel,info,i,peak_nr,global_peak_id,j,ii,jj
   integer::grid,nx_loc,ix,iy,iz,ind,icpu,idim
-  integer::ig,iNp,irad
+  integer::ig,iNp,irad,nener_offset
   real(dp)::scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2,scale_kappa,scale_Np,scale_Fp
   real(dp)::d,vol,M,ekk,err,phi_rel,de,c_sound,d0,v_bulk2,p,T2,c_code
   real(dp)::dx,dx_loc,scale,vol_loc,abs_err,A1=0.,A2=0.,A3=0.
@@ -209,6 +213,10 @@ subroutine compute_clump_properties_round2(xx)
   real(dp),dimension(1:nGroups)::Np2Ep_flux
 #endif
 
+#if NENER>0
+  nener_offset = inener-1
+#endif
+  
   ! Conversion factor from user units to cgs units
   call units(scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2)
 
@@ -232,7 +240,7 @@ subroutine compute_clump_properties_round2(xx)
 
 #if NDIM==3
   call surface_int
-  
+
   ! initialize arrays
   clump_size=0.d0; clump_mass4=0.d0
   grav_term=0.d0; rad_term=0.d0 
@@ -346,7 +354,7 @@ subroutine compute_clump_properties_round2(xx)
         err=0.d0
 #if NENER>0
         do irad=1,nener
-           err=err+uold(icellp(ipart),ndim+2+irad)
+           err=err+uold(icellp(ipart),nener_offset+irad)
         end do
 #endif
 
@@ -421,7 +429,7 @@ subroutine compute_clump_properties_round2(xx)
        +kinetic_support(1:npeaks)+thermal_support(1:npeaks)+magnetic_support(1:npeaks))
 
   do j=npeaks,1,-1
-     if (relevance(j)>0.)then
+     if (relevance(j)>0..and.n_cells(j)>0)then
         contracting(j)=.true.
         if (n_cells(j)>1)then !not just one cell...        
            !compute eigenvalues and eigenvectors of Icl_d_3by3
@@ -456,7 +464,7 @@ subroutine compute_clump_properties_round2(xx)
         write(*,'(135A)')'======================================================================================================================================'
      end if
      do j=npeaks,1,-1
-        if (relevance(j)>0.)then
+        if (relevance(j)>0..and.n_cells(j)>0)then
 
            write(*,'(I4,2X,I8,2x,3(L2,2X),(L2,6X),8(E9.2E2,3X))')j+ipeak_start(myid)&
                 ,n_cells(j)&
@@ -468,6 +476,7 @@ subroutine compute_clump_properties_round2(xx)
                 ,MagPsurf(j),MagTsurf(j)&
                 ,kinetic_support(j),thermal_support(j),magnetic_support(j)&
                 ,rad_term(j)
+
         end if
      end do
   end if
@@ -701,7 +710,7 @@ end subroutine surface_int
 subroutine surface_int_np(ind_cell,np,ilevel)
   use amr_commons
   use clfind_commons, ONLY: center_of_mass,Psurf,MagPsurf,MagTsurf
-  use hydro_commons, ONLY: uold,gamma,nvar,nener,smallr
+  use hydro_commons, ONLY: uold,gamma,nvar,nener,inener,smallr
   implicit none
   integer::np,ilevel
   integer,dimension(1:nvector)::ind_grid,ind_cell
@@ -720,13 +729,14 @@ subroutine surface_int_np(ind_cell,np,ilevel)
   integer ,dimension(1:nvector)::loc_clump_nr
   real(dp),dimension(1:twotondim,1:3)::xc
   real(dp),dimension(1:nvector,1:ndim)::xtest,r
-  real(dp),dimension(1:nvector)::ekk_cell,ekk_neigh,P_cell,P_neigh,r_dot_n,err_cell
+  real(dp),dimension(1:nvector)::ekk_cell,emag_cell,P_cell,r_dot_n,err_cell
+  real(dp)::P_neigh,err_neigh,emag_neigh,ekk_neigh
   real(dp),dimension(1:3)::skip_loc,n
   logical ,dimension(1:nvector)::ok
   logical,dimension(1:ndim)::period
   real(dp),dimension(1:nvector)::B_dot_n,B_dot_r,B2
   real(dp),dimension(1:nvector,1:3)::B
-  integer::irad
+  integer::irad, nener_offset
 
   period(1)=(nx==1)
 #if NDIM>1
@@ -736,6 +746,10 @@ subroutine surface_int_np(ind_cell,np,ilevel)
   if(ndim>2)period(3)=(nz==1)
 #endif
 
+#if NENER>0
+  nener_offset = inener-1
+#endif
+  
 #if NDIM==3
 
   ! Mesh spacing in that level
@@ -759,25 +773,31 @@ subroutine surface_int_np(ind_cell,np,ilevel)
      xc(ind,3)=(dble(iz)-0.5D0)*dx
   end do
   
-  ekk_cell=0.d0; P_neigh=0.d0; P_cell=0.d0; 
-  B=0d0; err_cell=0.d0
+  emag_cell=0.d0; ekk_cell=0.d0; err_cell=0.d0
 
   ! some preliminary action...
   do j=1,np
      indv(j)=(ind_cell(j)-ncoarse-1)/ngridmax+1           ! cell position in grid
      ind_grid(j)=ind_cell(j)-ncoarse-(indv(j)-1)*ngridmax ! grid index
      clump_nr(j)=flag2(ind_cell(j))                       ! save clump number
+
      ! compute pressure in cell
      do jdim=1,ndim
         ekk_cell(j)=ekk_cell(j)+0.5*uold(ind_cell(j),jdim+1)**2
      end do
      ekk_cell(j)=ekk_cell(j)/max(uold(ind_cell(j),1),smallr)
-#if NENER>0
-     do irad=1,nener
-        err_cell(j)=err_cell(j)+uold(ind_cell(j),ndim+2+irad)
+
+#ifdef SOLVERmhd
+     do idim=1,3
+        emag_cell(j)=emag_cell(j)+0.125d0*(uold(ind_cell(j),idim+5)+uold(ind_cell(j),idim+nvar))**2
      end do
 #endif
-     P_cell(j)=(gamma-1.0)*(uold(ind_cell(j),ndim+2)-ekk_cell(j)-err_cell(j))
+#if NENER>0
+     do irad=1,nener
+        err_cell(j)=err_cell(j)+uold(ind_cell(j),nener_offset+irad)
+     end do
+#endif
+     P_cell(j)=(gamma-1.0)*(uold(ind_cell(j),ndim+2)-ekk_cell(j)-err_cell(j)-emag_cell(j))
   end do
   
   do j=1,np
@@ -883,18 +903,32 @@ subroutine surface_int_np(ind_cell,np,ilevel)
                  end do
               end do
 #endif
-              
-              ekk_neigh=0.
+
               do j=1,np
-                 if (ok(j))then 
+                 if (ok(j))then                    
+
+                    ekk_neigh=0.d0
                     do jdim=1,ndim
-                       ekk_neigh(j)=ekk_neigh(j)+0.5*uold(cell_index(j),jdim+1)**2
+                       ekk_neigh=ekk_neigh+0.5*uold(cell_index(j),jdim+1)**2
                     end do
-                    ekk_neigh(j)=ekk_neigh(j)/max(uold(cell_index(j),1),smallr)
-                    P_neigh(j)=(gamma-1.0)*(uold(cell_index(j),ndim+2)-ekk_neigh(j))
+                    ekk_neigh=ekk_neigh/max(uold(cell_index(j),1),smallr)
+
+                    emag_neigh=0.d0
+#ifdef SOLVERmhd
+                    do jdim=1,ndim
+                       emag_neigh=emag_neigh+0.125d0*(uold(cell_index(j),jdim+5)+uold(cell_index(j),jdim+nvar))**2
+                    end do
+#endif
+                    err_neigh=0.d0
+#if NENER>0
+                    do irad=1,nener
+                       err_neigh=err_neigh+uold(cell_index(j),nener_offset+irad)
+                    end do
+#endif                    
+                    P_neigh=(gamma-1.0)*(uold(cell_index(j),ndim+2)-ekk_neigh-emag_neigh-err_neigh)
 
                     ! add to the actual terms for the virial analysis
-                    Psurf(loc_clump_nr(j))    = Psurf(loc_clump_nr(j))    + 0.5d0*(P_neigh(j)+P_cell(j))* r_dot_n(j) * dx_loc**2
+                    Psurf(loc_clump_nr(j))    = Psurf(loc_clump_nr(j))    + 0.5d0*(P_neigh + P_cell(j)) * r_dot_n(j) * dx_loc**2
 #ifdef SOLVERmhd
                     MagPsurf(loc_clump_nr(j)) = MagPsurf(loc_clump_nr(j)) + 0.5d0*B2(j)                 * r_dot_n(j) * dx_loc**2
                     MagTsurf(loc_clump_nr(j)) = MagTsurf(loc_clump_nr(j)) + B_dot_r(j)                  * B_dot_n(j) * dx_loc**2
@@ -1009,14 +1043,29 @@ subroutine surface_int_np(ind_cell,np,ilevel)
 #endif
                  do j=1,np
                     if (ok(j))then
+
+                       ekk_neigh=0.d0
                        do jdim=1,ndim
-                          ekk_neigh(j)=ekk_neigh(j)+0.5*uold(cell_index(j),jdim+1)**2
+                          ekk_neigh=ekk_neigh+0.5*uold(cell_index(j),jdim+1)**2
                        end do
-                       ekk_neigh(j)=ekk_neigh(j)/max(uold(cell_index(j),1),smallr)
-                       P_neigh(j)=(gamma-1.0)*(uold(cell_index(j),ndim+2)-ekk_neigh(j))
+                       ekk_neigh=ekk_neigh/max(uold(cell_index(j),1),smallr)
+
+                       emag_neigh=0.d0
+#ifdef SOLVERmhd
+                       do jdim=1,ndim
+                          emag_neigh=emag_neigh+0.125d0*(uold(cell_index(j),jdim+5)+uold(cell_index(j),jdim+nvar))**2
+                       end do
+#endif
+                       err_neigh=0.d0
+#if NENER>0
+                       do irad=1,nener
+                          err_neigh=err_neigh+uold(cell_index(j),nener_offset+irad)
+                       end do
+#endif
+                       P_neigh=(gamma-1.0)*(uold(cell_index(j),ndim+2)-ekk_neigh-emag_neigh-err_neigh)
 
                        ! add to the actual terms for the virial analysis
-                       Psurf(loc_clump_nr(j))    = Psurf(loc_clump_nr(j))    + 0.5d0*(P_neigh(j)+P_cell(j))* r_dot_n(j) * 0.25d0 * dx_loc**2
+                       Psurf(loc_clump_nr(j))    = Psurf(loc_clump_nr(j))    + 0.5d0*(P_neigh + P_cell(j)) * r_dot_n(j) * 0.25d0 * dx_loc**2
 #ifdef SOLVERmhd
                        MagPsurf(loc_clump_nr(j)) = MagPsurf(loc_clump_nr(j)) + 0.5d0*B2(j)                 * r_dot_n(j) * 0.25d0 * dx_loc**2
                        MagTsurf(loc_clump_nr(j)) = MagTsurf(loc_clump_nr(j)) + B_dot_r(j)                  * B_dot_n(j) * 0.25d0 * dx_loc**2

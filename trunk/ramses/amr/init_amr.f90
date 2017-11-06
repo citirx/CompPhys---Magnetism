@@ -28,6 +28,7 @@ subroutine init_amr
   real(dp),allocatable,dimension(:)::bxmin,bxmax
   integer,parameter::tag=1100
   integer::dummy_io,info2
+  real(kind=8),allocatable,dimension(:)::bound_key_restart
   
   if(verbose.and.myid==1)write(*,*)'Entering init_amr'
 
@@ -254,6 +255,10 @@ subroutine init_amr
      endif
 #endif
 
+#ifdef QUADHILBERT
+    if(nrestart_quad.eq.nrestart) allocate(bound_key_restart(0:ndomain))
+#endif
+
      ilun=myid+10
      call title(nrestart,nchar)
 
@@ -284,8 +289,10 @@ subroutine init_amr
      read(ilun)ngrid_current
      read(ilun)boxlen
      if(ncpu2.ne.ncpu)then
-        write(*,*)'Number of processes not compatible'
-        write(*,*)'ncpu should be set equal to',ncpu2
+        if(myid==1)then
+           write(*,*)'Number of processes not compatible'
+           write(*,*)'ncpu should be set equal to',ncpu2
+        endif
         call clean_stop
      end if
      ! Read time variables
@@ -314,12 +321,13 @@ subroutine init_amr
      aout(1:noutput2)=aout2(1:noutput2)
      iout=iout2
      ifout=ifout2
+     if(ifout.gt.nrestart+1) ifout=nrestart+1
      read(ilun)t
      read(ilun)dtold(1:nlevelmax2)
      read(ilun)dtnew(1:nlevelmax2)
      read(ilun)nstep,nstep_coarse
      nstep_coarse_old=nstep_coarse
-     read(ilun)const,mass_tot_0,rho_tot
+     read(ilun)einit,mass_tot_0,rho_tot
      read(ilun)omega_m,omega_l,omega_k,omega_b,h0,aexp_ini,boxlen_ini
      read(ilun)aexp,hexp,aexp_old,epot_tot_int,epot_tot_old
      if(cosmo)then
@@ -328,6 +336,7 @@ subroutine init_amr
         read(ilun)mass_sph2
      endif
      if(myid==1)write(*,*)'Restarting at t=',t,' nstep_coarse=',nstep_coarse
+     trestart = t
 
      ! Compute movie frame number if applicable
      if(imovout>0) then
@@ -380,7 +389,16 @@ subroutine init_amr
         read(ilun)bisec_cpubox_min(1:ncpu,1:ndim)
         read(ilun)bisec_cpubox_max(1:ncpu,1:ndim)
      else
+#ifdef QUADHILBERT
+        if(nrestart_quad.eq.nrestart) then
+           read(ilun)bound_key_restart(0:ndomain)
+           bound_key(0:ndomain)=bound_key_restart(0:ndomain)
+        else
+           read(ilun)bound_key(0:ndomain)
+        endif
+#else
         read(ilun)bound_key(0:ndomain)
+#endif
      endif
      ! Read coarse level
      read(ilun)son(1:ncoarse)
@@ -482,6 +500,9 @@ subroutine init_amr
         end do
      end do
      close(ilun)
+#ifdef QUADHILBERT
+     if(nrestart_quad.eq.nrestart) deallocate(bound_key_restart)
+#endif
 
      ! Send the token
 #ifndef WITHOUTMPI

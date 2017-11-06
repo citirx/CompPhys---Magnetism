@@ -2,12 +2,14 @@
 SUBROUTINE rt_init
 
 !  Initialize everything for radiative transfer
+!  Some initialisation is also needed in case of non-equilibrium
+!  chemistry, even if rt=.false.
 !-------------------------------------------------------------------------
   use amr_commons
   use hydro_commons
   use rt_hydro_commons
   use rt_flux_module
-  use rt_cooling_module, only: update_UVrates
+  use rt_cooling_module,only:rt_isIRtrap,iIRtrapVar
   use rt_parameters
   use SED_module
   use UV_module
@@ -17,12 +19,15 @@ SUBROUTINE rt_init
   if(verbose)write(*,*)'Entering init_rt'
   ! Count the number of variables and check if ok:
   nvar_count = ichem-1     ! # of non-rt vars: rho u v w p (z) (delay) (x)
-  iIons=ichem              !         Starting index of xhii, xheii, xheiii
-  nvar_count = iIons+NIONS-1     !                            # hydro vars
-  if(nvar_count .ne. nvar) then 
+  if(rt_isIRtrap) &
+     iIRtrapVar = inener  ! Trapped rad. stored in nonthermal pressure var
+  iIons=nvar_count+1         !      Starting index of ionisation fractions
+  nvar_count = nvar_count+NIONS  !                            # hydro vars
+
+  if(nvar_count .gt. nvar) then 
      if(myid==1) then 
         write(*,*) 'rt_init(): Something wrong with NVAR.'
-        write(*,*) 'Should have NVAR=2+ndim+1*metal+1*dcool+1*aton+nIons'
+        write(*,*) 'Should have NVAR=2+ndim+1*metal+1*dcool+1*aton+IRtrap+nIons'
         write(*,*) 'Have NVAR=',nvar
         write(*,*) 'Should have NVAR=',nvar_count
         write(*,*) 'STOPPING!'
@@ -51,8 +56,6 @@ SUBROUTINE rt_init
   ! UV propagation is checked in set_model
   ! Star feedback is checked in amr_step
 
-  ! Update hydro variable to the initial ionized species
-  var_region(1:rt_nregion,iIons-ndim-2)=rt_xion_region(1:rt_nregion)
   do i=1,nGroups  ! Starting indices in uold and unew of each photon group
      iGroups(i)=1+(ndim+1)*(i-1)
      if(nrestart.eq.0) then
@@ -64,7 +67,7 @@ SUBROUTINE rt_init
 
   tot_cool_loopcnt=0 ; max_cool_loopcnt=0 ; n_cool_cells=0
   loopCodes=0
-  tot_nPhot=0.d0 ;  step_nPhot=0.d0; step_nStar=0.d0
+  tot_nPhot=0.d0 ;  step_nPhot=0.d0; step_nStar=0.d0; step_mStar=0.d0
 END SUBROUTINE rt_init
 
 !*************************************************************************
@@ -134,20 +137,21 @@ SUBROUTINE read_rt_params(nml_ok)
 !-------------------------------------------------------------------------
   namelist/rt_params/rt_star, rt_esc_frac, rt_flux_scheme, rt_smooth     &
        & ,rt_is_outflow_bound, rt_TConst, rt_courant_factor              &
-       & ,rt_c_fraction, rt_otsa, sedprops_update, hll_evals_file        &
+       & ,rt_c_fraction, rt_nsubcycle, rt_otsa, sedprops_update          &
        & ,sed_dir, uv_file, rt_UVsrc_nHmax, nUVgroups, nSEDgroups        &
-       & ,SED_isEgy, rt_output_coolstats                                 &
-       & ,upload_equilibrium_x, X, Y, rt_is_init_xion, rt_UV_nhSS        &
+       & ,SED_isEgy, rt_output_coolstats, hll_evals_file                 &
+       & ,upload_equilibrium_x, X, Y, rt_is_init_xion                    &
        & ,rt_err_grad_n, rt_floor_n, rt_err_grad_xHII, rt_floor_xHII     &
        & ,rt_err_grad_xHI, rt_floor_xHI, rt_refine_aexp                  &
-       & ,convert_birth_times,isHe,isH2                                  &
+       & ,convert_birth_times,isHe,isH2,is_mu_H2                         &
+       & ,rt_isIR, is_kIR_T, rt_T_rad, rt_vc, rt_pressBoost              &
+       & ,rt_isoPress, rt_isIRtrap, iPEH_group                           &
        ! RT regions (for initialization)                                 &
        & ,rt_nregion, rt_region_type                                     &
        & ,rt_reg_x_center, rt_reg_y_center, rt_reg_z_center              &
        & ,rt_reg_length_x, rt_reg_length_y, rt_reg_length_z              &
        & ,rt_exp_region, rt_reg_group                                    &
        & ,rt_n_region, rt_u_region, rt_v_region, rt_w_region             &
-       & ,rt_xion_region                                                 &
        ! RT source regions (for every timestep)                          &
        & ,rt_nsource, rt_source_type                                     &
        & ,rt_src_x_center, rt_src_y_center, rt_src_z_center              &
@@ -156,6 +160,17 @@ SUBROUTINE read_rt_params(nml_ok)
        & ,rt_n_source, rt_u_source, rt_v_source, rt_w_source             &
        ! RT boundary (for boundary conditions)                           &
        & ,rt_n_bound,rt_u_bound,rt_v_bound,rt_w_bound
+
+
+  ! Set default initialisation of ionisation states:
+  ! -Off if restarting, but can set to true (for postprocessing)
+  ! -On otherwise, but can set to false (for specificic initialisation)
+  if(nrestart .gt. 0) then
+     rt_is_init_xion=.false.
+  else
+     rt_is_init_xion=.true.
+  endif
+
   ! Read namelist file
   rewind(1)
   read(1,NML=rt_params,END=101)
@@ -169,39 +184,45 @@ SUBROUTINE read_rt_params(nml_ok)
 
   rt_c_cgs = c_cgs * rt_c_fraction
   !call update_rt_c
-  if(haardt_madau) rt_UV_hom=.true.                     ! UV in every cell
+
+  ! Trapped IR pressure closure as in Rosdahl & Teyssier 2015, eq 43:
+  if(rt_isIRtrap) gamma_rad(1) = rt_c_fraction / 3d0 + 1d0
+
   if(rt_Tconst .ge. 0.d0) rt_isTconst=.true. 
   
-  ! Set indexes of ionization fractions, and ionization energies, and 
-  ! check if we have enough ionization variables (NIONS)                 !
+  ! Set number of used ionisation fractions, indexes of ionization
+  ! fractions, and ionization energies, and check if we have enough
+  ! ionization variables (NIONS)
   iCount=0
   if(isH2) then
-     iCount=iCount+1 ; ixHI=iCount    ; ionEvs(ixHI)=ionEv_HI
+     iCount=iCount+1
+     ixHI=iCount    ; ionEvs(ixHI)=ionEv_HI
   endif
   iCount=iCount+1    ; ixHII=iCount   ; ionEvs(ixHII)=ionEv_HII
   if(isHe) then
      iCount=iCount+1 ; ixHeII=iCount  ; ionEvs(ixHeII)=ionEv_HeII
      iCount=iCount+1 ; ixHeIII=iCount ; ionEvs(ixHeIII)=ionEv_HeIII
   endif
-  if(iCount .gt. NIONS) then
+  nIonsUsed = iCount
+  if(nIonsUsed .gt. NIONS) then
      if(myid==1) then
         write(*,*) 'Not enough variables for ionization fractions'
         write(*,*) 'Have NIONS=',NIONS
-        write(*,*) 'Need NIONS=',iCount
+        write(*,*) 'Need NIONS=',nIonsUsed
         write(*,*) 'STOPPING!'
      endif
      call clean_stop
   endif
-  if(iCount .lt. NIONS) then
+  if(nIonsUsed .lt. NIONS) then
      if(myid==1) then
         write(*,*) 'Too many variables for ionization fractions'
         write(*,*) 'Have NIONS=',NIONS
-        write(*,*) 'Need NIONS=',iCount
+        write(*,*) 'Need NIONS=',nIonsUsed
         write(*,*) 'Probably no harm, so still continuing...'
      endif
   endif
   if(myid==1) then
-     write(*,*) 'Number of ionization fractions is:',iCount
+     write(*,*) 'Number of ionization fractions is:',nIonsUsed
      write(*,*) 'The indexes are iHI, iHII, iHeII, iHeIII ='              &
                 , ixHI, ixHII, ixHeII, ixHeIII
   endif
@@ -216,16 +237,17 @@ SUBROUTINE read_rt_groups(nml_ok)
 !-------------------------------------------------------------------------
   use amr_commons
   use rt_parameters
+  use rt_cooling_module
   use SED_module
   implicit none
   logical::nml_ok
   integer::i,igroup_HI=0, igroup_HII=0, igroup_HeII=0, igroup_HeIII=0
-!------------------------------------------------------------------------
+!-------------------------------------------------------------------------
   namelist/rt_groups/group_csn, group_cse, group_egy, spec2group         &
-       & , groupL0, groupL1
+       & , groupL0, groupL1, kappaAbs, kappaSc
   if(myid==1) then
-     write(*,'(" Working with ",I2," photon groups and  " &
-          ,I2, " ion species")')nGroups,nIons
+     write(*,'(" Working with ",I2," photon groups and  "                &
+          ,I2, " ion species")') nGroups, nIons
      write(*,*) ''
   endif
    
@@ -233,8 +255,7 @@ SUBROUTINE read_rt_groups(nml_ok)
      rt = .false.
      return
   endif
-
-  ! BEGIN joki ===========================================================
+#if NGROUPS>0
   !  Use H2, HI, HeI, HeII ionization energies  as default group intervals
   groupL0(1:min(nGroups,nIons))=ionEvs(1:min(nGroups,nIons))! Lower bounds
   groupL1(1:min(nGroups,nIons-1))=ionEvs(2:min(nGroups+1,nIons)) !   Upper
@@ -254,7 +275,7 @@ SUBROUTINE read_rt_groups(nml_ok)
      i=i+1 ; igroup_HeIII=i
   endif
   
-  ! Default groups are all blackbodies at E5 Kelvin:
+  ! Default groups are all blackbodies at 10^5 Kelvin:
   group_csn=0d0 ; group_cse=0d0 ; group_egy=0d0         ! Default all zero
   if(igroup_HI .gt. 0) then
      group_csn(igroup_HI,ixHI)=3d-22                     ! H2 dissociation
@@ -282,11 +303,12 @@ SUBROUTINE read_rt_groups(nml_ok)
      group_cse(igroup_HeIII,ixHeIII)=1.001d-18
      group_egy(igroup_HeIII)=65.666
   endif
-  ! END joki =============================================================
+#endif
 
   do i=1,min(nIons,nGroups)
-     spec2group(i)=i      ! Species contributions to groups (for non-OTSA)
+     spec2group(i)=i                   ! Species contributions to groups
   end do
+  
   ! Read namelist file
   rewind(1)
   read(1,NML=rt_groups,END=101)
@@ -329,6 +351,7 @@ SUBROUTINE add_rt_sources(ilevel,dt)
   real(dp),dimension(1:nvector,1:ndim),save::xx
   real(dp),dimension(1:nvector,1:nrtvar),save::uu
 !------------------------------------------------------------------------
+  call add_UV_background(ilevel,dt)
   if(numbtot(1,ilevel)==0)return    ! no grids at this level
   if(rt_nsource .le. 0) return      ! no rt sources
   if(verbose)write(*,111)ilevel
@@ -404,6 +427,69 @@ SUBROUTINE add_rt_sources(ilevel,dt)
 END SUBROUTINE add_rt_sources
 
 !************************************************************************
+SUBROUTINE add_UV_background(ilevel,dt)
+
+! Inject radiation from RT source regions (from the RT namelist). Since 
+! the light sources are continuously emitting radiation, this is called
+! continuously during code execution, rather than just during 
+! initialization.
+!
+! ilevel => amr level at which to inject the radiation
+! dt     => timestep for injection (since injected values are per time)
+!------------------------------------------------------------------------
+  use UV_module, ONLY: UV_Nphot_cgs, nUVgroups, iUVgroups
+  use amr_commons
+  use rt_parameters
+  use hydro_commons
+  use rt_hydro_commons
+  implicit none
+  integer::ilevel
+  real(dp)::dt
+  integer::i,igrid,ncache,iskip,ngrid,j
+  integer::ind,ivar,ind_group,ic,ig
+  integer ,dimension(1:nvector),save::ind_grid
+  real(dp),dimension(1:3)::skip_loc
+  real(dp)::scale_nH,scale_T2,scale_l,scale_d,scale_t,scale_v,scale_np  &
+            ,scale_fp,efactor,nH
+!------------------------------------------------------------------------
+  if(numbtot(1,ilevel)==0)return     ! no grids at this level
+  if(.not. rt_isDiffuseUVsrc) return ! no propagated UV background
+  if(verbose)write(*,111)ilevel
+
+  call units(scale_l,scale_t,scale_d,scale_v,scale_nH,scale_T2)
+  call rt_units(scale_np, scale_fp)
+
+  ncache=active(ilevel)%ngrid
+  ! Loop over grids by vector sweeps
+  do igrid=1,ncache,nvector
+     ngrid=MIN(nvector,ncache-igrid+1)
+     do i=1,ngrid
+        ind_grid(i)=active(ilevel)%igrid(igrid+i-1)
+     end do
+     ! Loop over cells
+     do ind=1,twotondim
+        iskip=ncoarse+(ind-1)*ngridmax
+        do i=1,ngrid
+           ic=iskip+ind_grid(i) ! cell index
+           ! Read the local gas density and inject the UV radiation
+           nH=unew(ic,1)*scale_nH
+           efactor = exp(-nH/rt_UVsrc_nHmax)
+           do j=1,nUVgroups
+              ig = iGroups(iUVgroups(j))
+              rtunew(ic,ig) = max(rtunew(ic,ig)                     &
+                                 ,UV_Nphot_cgs(j)/scale_np * efactor)
+           end do
+        end do
+     end do
+     ! End loop over cells
+  end do
+  ! End loop over grids
+
+111 format('   Entering add_UV_background for level ',I2)
+
+END SUBROUTINE add_UV_background
+
+!************************************************************************
 SUBROUTINE rt_sources_vsweep(x,uu,dx,dt,nn)
 
 ! Do a vector sweep, injecting RT source regions into cells, that is if
@@ -424,7 +510,8 @@ SUBROUTINE rt_sources_vsweep(x,uu,dx,dt,nn)
   real(dp),dimension(1:nvector,1:ndim)::x
   integer::i,k,group_ind
   real(dp)::vol,r,xn,yn,zn,en
-  real(dp)::scale_nH,scale_T2,scale_l,scale_d,scale_t,scale_v,scale_np,scale_fp
+  real(dp)::scale_nH,scale_T2,scale_l,scale_d,scale_t,scale_v
+  real(dp)::scale_np,scale_fp
 !------------------------------------------------------------------------
   ! Initialize everything to zero
   !  uu=0.0d0
@@ -462,20 +549,20 @@ SUBROUTINE rt_sources_vsweep(x,uu,dx,dt,nn)
            if(r<1.0)then
               uu(i,group_ind) = rt_n_source(k)/rt_c_cgs/scale_Np
               ! The input flux is the fraction Fp/(c*Np) (Max 1 magnitude)
-              uu(i,group_ind+1) =                       &
-                       + rt_u_source(k) * rt_c * rt_n_source(k) / scale_Np
+              uu(i,group_ind+1) =                                       &
+                        rt_u_source(k) * rt_c * rt_n_source(k) / scale_Np
 #if NDIM>1 
-              uu(i,group_ind+2) =                       &
-                       + rt_v_source(k) * rt_c * rt_n_source(k) / scale_Np
+              uu(i,group_ind+2) =                                       &
+                        rt_v_source(k) * rt_c * rt_n_source(k) / scale_Np
 #endif
 #if NDIM>2
-              uu(i,group_ind+3) =                       &
-                       + rt_w_source(k) * rt_c * rt_n_source(k) / scale_Np
+              uu(i,group_ind+3) =                                       &
+                        rt_w_source(k) * rt_c * rt_n_source(k) / scale_Np
 #endif
            end if
         end do
      end if
-     
+
      ! For "point" regions only:
      if(rt_source_type(k) .eq. 'point')then
         ! Volume elements
@@ -483,7 +570,6 @@ SUBROUTINE rt_sources_vsweep(x,uu,dx,dt,nn)
         ! Compute CIC weights relative to region center
         do i=1,nn
            xn=1.0; yn=1.0; zn=1.0
-           ! Buffer injection:
            xn=max(1.0-abs(x(i,1)-rt_src_x_center(k))/dx, 0.0_dp)
 #if NDIM>1
            yn=max(1.0-abs(x(i,2)-rt_src_y_center(k))/dx, 0.0_dp)

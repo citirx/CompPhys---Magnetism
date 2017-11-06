@@ -2,6 +2,8 @@
 SUBROUTINE rt_init
 
 !  Initialize everything for radiative transfer
+!  Some initialisation is also needed in case of non-equilibrium
+!  chemistry, even if rt=.false.
 !-------------------------------------------------------------------------
   use amr_commons
   use hydro_commons
@@ -18,7 +20,7 @@ SUBROUTINE rt_init
   ! Count the number of variables and check if ok:
   nvar_count = ichem-1     ! # of non-rt vars: rho u v w p (z) (delay) (x)
   if(rt_isIRtrap) &
-     iIRtrapVar = ndim+3  ! Trapped rad. stored in nonthermal pressure var
+     iIRtrapVar = inener  ! Trapped rad. stored in nonthermal pressure var
   iIons=nvar_count+1         !      Starting index of ionisation fractions
   nvar_count = nvar_count+3  !                                # hydro vars
 
@@ -54,8 +56,6 @@ SUBROUTINE rt_init
   ! UV propagation is checked in set_model
   ! Star feedback is checked in amr_step
 
-  ! Update hydro variable to the initial ionized species
-  var_region(1:rt_nregion,iIons-ndim-2)=rt_xion_region(1:rt_nregion)
   do i=1,nGroups  ! Starting indices in uold and unew of each photon group
      iGroups(i)=1+(ndim+1)*(i-1)
      if(nrestart.eq.0) then
@@ -142,8 +142,7 @@ SUBROUTINE read_rt_params(nml_ok)
        & ,upload_equilibrium_x, X, Y, rt_is_init_xion                    &
        & ,rt_err_grad_n, rt_floor_n, rt_err_grad_xHII, rt_floor_xHII     &
        & ,rt_err_grad_xHI, rt_floor_xHI, rt_refine_aexp                  &
-       & ,convert_birth_times, is_mu_H2                                  &
-       & ,rt_isIR, is_kIR_T, rt_T_rad, rt_vc, rt_pressBoost              &
+       & ,is_mu_H2,rt_isIR, is_kIR_T, rt_T_rad, rt_vc, rt_pressBoost     &
        & ,rt_isoPress, rt_isIRtrap                                       &
        ! RT regions (for initialization)                                 &
        & ,rt_nregion, rt_region_type                                     &
@@ -151,7 +150,6 @@ SUBROUTINE read_rt_params(nml_ok)
        & ,rt_reg_length_x, rt_reg_length_y, rt_reg_length_z              &
        & ,rt_exp_region, rt_reg_group                                    &
        & ,rt_n_region, rt_u_region, rt_v_region, rt_w_region             &
-       & ,rt_xion_region                                                 &
        ! RT source regions (for every timestep)                          &
        & ,rt_nsource, rt_source_type                                     &
        & ,rt_src_x_center, rt_src_y_center, rt_src_z_center              &
@@ -159,9 +157,17 @@ SUBROUTINE read_rt_params(nml_ok)
        & ,rt_exp_source, rt_src_group                                    &
        & ,rt_n_source, rt_u_source, rt_v_source, rt_w_source             &
        ! RT boundary (for boundary conditions)                           &
-       & ,rt_n_bound,rt_u_bound,rt_v_bound,rt_w_bound                    &
-       & ,rt_movie_vars
+       & ,rt_n_bound,rt_u_bound,rt_v_bound,rt_w_bound
 
+
+  ! Set default initialisation of ionisation states:
+  ! -Off if restarting, but can set to true (for postprocessing)
+  ! -On otherwise, but can set to false (for specificic initialisation)
+  if(nrestart .gt. 0) then
+     rt_is_init_xion=.false.
+  else
+     rt_is_init_xion=.true.
+  endif
 
   ! Read namelist file
   rewind(1)
@@ -176,6 +182,10 @@ SUBROUTINE read_rt_params(nml_ok)
 
   rt_c_cgs = c_cgs * rt_c_fraction
   !call update_rt_c
+  
+  ! Trapped IR pressure closure as in Rosdahl & Teyssier 2015, eq 43:
+  if(rt_isIRtrap) gamma_rad(1) = rt_c_fraction / 3d0 + 1d0
+
   if(rt_Tconst .ge. 0.d0) rt_isTconst=.true. 
   call read_rt_groups(nml_ok)
 END SUBROUTINE read_rt_params
